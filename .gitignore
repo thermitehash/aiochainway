@@ -1,0 +1,23 @@
+# Chainway SDK, demos, manuals and any disassembly output. Never commit.
+vendor/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+mutants/
+.mutmut-cache
+.DS_Store
+*.pcap
+*.pcapng
