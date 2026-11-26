@@ -6,8 +6,7 @@ import pytest
 
 from aiochainway.protocol.errors import FrameError
 from aiochainway.protocol.tags import epc_length, parse_tag_record, rssi_to_dbm
-
-from .fake_reader import tag_record
+from aiochainway.testing import tag_record
 
 EPC96 = "E28011700000020A1B2C3D4E"
 EPC128 = "300833B2DDD9014000000000ABCD1234"

@@ -36,9 +36,9 @@ from aiochainway import (
 from aiochainway.client import check_guard
 from aiochainway.protocol import commands as c
 from aiochainway.protocol.frame import Frame
+from aiochainway.testing import FakeUR4, tag_record
 
 from .conftest import eventually
-from .fake_reader import FakeReader, tag_record
 
 EPC = "E28011700000020A1B2C3D4E"
 
@@ -79,7 +79,7 @@ async def test_reads(client: UR4Client) -> None:
     assert await client.get_antenna_work_time(2) == 200
 
 
-async def test_writes_round_trip(client: UR4Client, fake: FakeReader) -> None:
+async def test_writes_round_trip(client: UR4Client, fake: FakeUR4) -> None:
     await client.set_work_mode(WorkMode.AUTO)
     assert await client.get_work_mode() is WorkMode.AUTO
     await client.set_antennas([1, 3])
@@ -114,7 +114,7 @@ async def test_writes_round_trip(client: UR4Client, fake: FakeReader) -> None:
 
 
 async def test_failure_status_raises_reader_error(
-    client: UR4Client, fake: FakeReader
+    client: UR4Client, fake: FakeUR4
 ) -> None:
     fake.faults.fail = {"set_region", "get_temperature"}
     with pytest.raises(ReaderError, match="set_region") as info:
@@ -124,7 +124,7 @@ async def test_failure_status_raises_reader_error(
     assert info2.temperature is None
 
 
-async def test_validation_before_sending(client: UR4Client, fake: FakeReader) -> None:
+async def test_validation_before_sending(client: UR4Client, fake: FakeUR4) -> None:
     before = len(fake.received)
     with pytest.raises(ValidationError):
         await client.set_power(1, 99)
@@ -133,7 +133,7 @@ async def test_validation_before_sending(client: UR4Client, fake: FakeReader) ->
     assert len(fake.received) == before
 
 
-async def test_unsupported(client: UR4Client, fake: FakeReader) -> None:
+async def test_unsupported(client: UR4Client, fake: FakeUR4) -> None:
     for call in (
         client.set_fastid(True),
         client.set_tagfocus(True),
@@ -148,7 +148,7 @@ async def test_unsupported(client: UR4Client, fake: FakeReader) -> None:
 
 
 async def test_guarded_commands_refuse_without_confirm(
-    client: UR4Client, fake: FakeReader
+    client: UR4Client, fake: FakeUR4
 ) -> None:
     net = ReaderNetworkConfig("192.168.99.50", "255.255.255.0", "192.168.99.1", 8888)
     with pytest.raises(UnsafeOperationError):
@@ -160,9 +160,7 @@ async def test_guarded_commands_refuse_without_confirm(
     assert fake.received == []
 
 
-async def test_guarded_commands_with_confirm(
-    client: UR4Client, fake: FakeReader
-) -> None:
+async def test_guarded_commands_with_confirm(client: UR4Client, fake: FakeUR4) -> None:
     net = ReaderNetworkConfig("192.168.99.50", "255.255.255.0", "192.168.99.1", 9999)
     result = await client.set_network_config(net, confirm=True)
     assert result.accepted and "verify" in result.message
@@ -200,7 +198,7 @@ def test_check_guard_inferred_needs_allow_unverified(
 
 
 async def test_timeout_names_command_and_releases_lock(
-    client: UR4Client, fake: FakeReader
+    client: UR4Client, fake: FakeUR4
 ) -> None:
     fake.faults.drop = {"get_version"}
     with pytest.raises(ReaderTimeout, match="get_version") as info:
@@ -212,7 +210,7 @@ async def test_timeout_names_command_and_releases_lock(
 
 
 async def test_delayed_reply_beyond_timeout_is_not_misassigned(
-    client: UR4Client, fake: FakeReader
+    client: UR4Client, fake: FakeUR4
 ) -> None:
     fake.faults.delay = 0.7  # > client timeout 0.5
     with pytest.raises(ReaderTimeout):
@@ -225,13 +223,13 @@ async def test_delayed_reply_beyond_timeout_is_not_misassigned(
     assert await client.get_work_mode() is WorkMode.COMMAND
 
 
-async def test_slow_but_in_time(client: UR4Client, fake: FakeReader) -> None:
+async def test_slow_but_in_time(client: UR4Client, fake: FakeUR4) -> None:
     fake.faults.delay = 0.2
     assert await client.get_version() == "V1.2.3"
 
 
 @pytest.mark.parametrize("mode", ["split", "chunk"])
-async def test_partial_writes(client: UR4Client, fake: FakeReader, mode: str) -> None:
+async def test_partial_writes(client: UR4Client, fake: FakeUR4, mode: str) -> None:
     if mode == "split":
         fake.faults.split_bytes = True
     else:
@@ -245,7 +243,7 @@ async def test_partial_writes(client: UR4Client, fake: FakeReader, mode: str) ->
 
 
 async def test_corrupted_xor_times_out_then_recovers(
-    client: UR4Client, fake: FakeReader
+    client: UR4Client, fake: FakeUR4
 ) -> None:
     fake.faults.corrupt_xor_next = 1
     with pytest.raises(ReaderTimeout):
@@ -254,9 +252,7 @@ async def test_corrupted_xor_times_out_then_recovers(
     assert await client.get_version() == "V1.2.3"
 
 
-async def test_duplicate_replies_are_dropped(
-    client: UR4Client, fake: FakeReader
-) -> None:
+async def test_duplicate_replies_are_dropped(client: UR4Client, fake: FakeUR4) -> None:
     fake.faults.duplicate = True
     assert await client.get_version() == "V1.2.3"
     assert await client.get_work_mode() is WorkMode.COMMAND
@@ -266,16 +262,14 @@ async def test_duplicate_replies_are_dropped(
     assert client.unmatched_frames == 3
 
 
-async def test_wrong_sub_command_not_accepted(
-    client: UR4Client, fake: FakeReader
-) -> None:
+async def test_wrong_sub_command_not_accepted(client: UR4Client, fake: FakeUR4) -> None:
     fake.faults.wrong_sub = {"get_work_mode"}
     with pytest.raises(ReaderTimeout):
         await client.get_work_mode()
 
 
 async def test_unsolicited_tags_between_replies(
-    client: UR4Client, fake: FakeReader
+    client: UR4Client, fake: FakeUR4
 ) -> None:
     fake.faults.unsolicited_tags = 3
     assert await client.get_version() == "V1.2.3"
@@ -284,7 +278,7 @@ async def test_unsolicited_tags_between_replies(
 
 
 async def test_refused_connection() -> None:
-    fake = FakeReader()
+    fake = FakeUR4()
     await fake.start()
     port = fake.port
     await fake.stop()
@@ -316,7 +310,7 @@ async def test_not_connected_raises() -> None:
             pass
 
 
-async def test_disconnect_fails_pending_and_calls_callback(fake: FakeReader) -> None:
+async def test_disconnect_fails_pending_and_calls_callback(fake: FakeUR4) -> None:
     lost: list[BaseException | None] = []
     client = UR4Client("127.0.0.1", fake.port, timeout=1.0, on_disconnect=lost.append)
     await client.connect()
@@ -336,7 +330,7 @@ async def test_disconnect_fails_pending_and_calls_callback(fake: FakeReader) -> 
 
 
 async def test_callback_exception_is_logged(
-    fake: FakeReader, caplog: pytest.LogCaptureFixture
+    fake: FakeUR4, caplog: pytest.LogCaptureFixture
 ) -> None:
     def boom(_: BaseException | None) -> None:
         raise RuntimeError("callback bug")
@@ -350,7 +344,7 @@ async def test_callback_exception_is_logged(
 
 
 async def test_context_manager_and_debug_logging(
-    fake: FakeReader, caplog: pytest.LogCaptureFixture
+    fake: FakeUR4, caplog: pytest.LogCaptureFixture
 ) -> None:
     with caplog.at_level(logging.DEBUG, logger="aiochainway"):
         async with UR4Client("127.0.0.1", fake.port, timeout=0.5) as client:
@@ -368,7 +362,7 @@ def test_constructor_validation() -> None:
         UR4Client("h", port=0)
 
 
-async def test_wait_for_reader(fake: FakeReader) -> None:
+async def test_wait_for_reader(fake: FakeUR4) -> None:
     waited = await wait_for_reader("127.0.0.1", fake.port, timeout=2)
     assert waited < 2
     await fake.stop()
@@ -379,9 +373,7 @@ async def test_wait_for_reader(fake: FakeReader) -> None:
 # Inventory -------------------------------------------------------------------------
 
 
-async def test_inventory_duration_sends_stop(
-    client: UR4Client, fake: FakeReader
-) -> None:
+async def test_inventory_duration_sends_stop(client: UR4Client, fake: FakeUR4) -> None:
     fake.tags = [
         tag_record(EPC, antenna=1),
         tag_record("AABB", antenna=3, rssi_dbm=-71.2),
@@ -397,7 +389,7 @@ async def test_inventory_duration_sends_stop(
     assert await client.get_version() == "V1.2.3"
 
 
-async def test_inventory_break_sends_stop(client: UR4Client, fake: FakeReader) -> None:
+async def test_inventory_break_sends_stop(client: UR4Client, fake: FakeUR4) -> None:
     async for tag in client.inventory():
         assert tag.epc == EPC
         break
@@ -408,7 +400,7 @@ async def test_inventory_break_sends_stop(client: UR4Client, fake: FakeReader) -
 
 
 async def test_inventory_exception_in_body_sends_stop(
-    client: UR4Client, fake: FakeReader
+    client: UR4Client, fake: FakeUR4
 ) -> None:
     stream = client.inventory()
     with pytest.raises(RuntimeError, match="consumer"):
@@ -419,7 +411,7 @@ async def test_inventory_exception_in_body_sends_stop(
 
 
 async def test_inventory_cancelled_from_another_task_sends_stop(
-    client: UR4Client, fake: FakeReader
+    client: UR4Client, fake: FakeUR4
 ) -> None:
     got: list[str] = []
 
@@ -439,7 +431,7 @@ async def test_inventory_cancelled_from_another_task_sends_stop(
 
 
 async def test_inventory_abandoned_stream_sends_stop_on_gc(
-    client: UR4Client, fake: FakeReader
+    client: UR4Client, fake: FakeUR4
 ) -> None:
     stream = client.inventory()
     await stream.__anext__()
@@ -448,7 +440,7 @@ async def test_inventory_abandoned_stream_sends_stop_on_gc(
     await fake.wait_for("stop_inventory")
 
 
-async def test_inventory_without_stop_ack(client: UR4Client, fake: FakeReader) -> None:
+async def test_inventory_without_stop_ack(client: UR4Client, fake: FakeUR4) -> None:
     fake.faults.no_stop_ack = True
     loop = asyncio.get_running_loop()
     start = loop.time()
@@ -459,7 +451,7 @@ async def test_inventory_without_stop_ack(client: UR4Client, fake: FakeReader) -
 
 
 async def test_inventory_disconnect_mid_inventory(
-    client: UR4Client, fake: FakeReader
+    client: UR4Client, fake: FakeUR4
 ) -> None:
     fake.faults.disconnect_after_tags = 5
     tags = []
@@ -473,7 +465,7 @@ async def test_inventory_disconnect_mid_inventory(
 
 
 async def test_second_concurrent_inventory_refused(
-    client: UR4Client, fake: FakeReader
+    client: UR4Client, fake: FakeUR4
 ) -> None:
     async with client.inventory() as first:
         await first.__anext__()
@@ -493,14 +485,14 @@ async def test_inventory_commands_during_inventory(client: UR4Client) -> None:
 
 
 async def test_inventory_skips_bad_tag_records(
-    client: UR4Client, fake: FakeReader
+    client: UR4Client, fake: FakeUR4
 ) -> None:
     fake.tags = [tag_record(EPC, antenna=9), tag_record(EPC, antenna=2)]
     tags = [t async for t in client.inventory(duration=0.1)]
     assert tags and {t.antenna for t in tags} == {2}
 
 
-async def test_inventory_queue_overflow_drops_oldest(fake: FakeReader) -> None:
+async def test_inventory_queue_overflow_drops_oldest(fake: FakeUR4) -> None:
     client = UR4Client(
         "127.0.0.1", fake.port, timeout=0.5, tag_queue_size=3, stop_drain=0.1
     )
@@ -526,7 +518,7 @@ async def test_stream_iterates_after_finish_raises_stop(client: UR4Client) -> No
     await stream.aclose()  # idempotent
 
 
-async def test_stop_inventory_standalone(client: UR4Client, fake: FakeReader) -> None:
+async def test_stop_inventory_standalone(client: UR4Client, fake: FakeUR4) -> None:
     await client.stop_inventory()
     assert fake.names() == ["stop_inventory"]
     fake.faults.no_stop_ack = True
@@ -541,7 +533,7 @@ async def test_stop_inventory_standalone(client: UR4Client, fake: FakeReader) ->
 
 
 async def test_fifty_concurrent_requests_serialize(
-    client: UR4Client, fake: FakeReader
+    client: UR4Client, fake: FakeUR4
 ) -> None:
     fake.faults.chunk = 2
     calls = [
@@ -553,7 +545,7 @@ async def test_fifty_concurrent_requests_serialize(
 
 
 async def test_cancel_during_request_leaves_client_usable(
-    client: UR4Client, fake: FakeReader
+    client: UR4Client, fake: FakeUR4
 ) -> None:
     fake.faults.delay = 0.2
     task = asyncio.create_task(client.get_version())
@@ -569,7 +561,7 @@ async def test_cancel_during_request_leaves_client_usable(
     assert client.unmatched_frames == 1
 
 
-async def test_close_while_request_pending(client: UR4Client, fake: FakeReader) -> None:
+async def test_close_while_request_pending(client: UR4Client, fake: FakeUR4) -> None:
     fake.faults.drop = {"get_version"}
     task = asyncio.create_task(client.get_version())
     await asyncio.sleep(0.05)

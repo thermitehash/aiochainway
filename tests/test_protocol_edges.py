@@ -40,8 +40,7 @@ from aiochainway.protocol.frame import (
     encode,
 )
 from aiochainway.protocol.tags import parse_tag_record
-
-from .fake_reader import tag_record
+from aiochainway.testing import tag_record
 
 H = bytes.fromhex
 STOP = H("A55A00088C840D0A")

@@ -2,7 +2,7 @@
 
 The pantry integration (Home Assistant, HACS) owns entities, the config flow and
 inventory logic. `aiochainway` owns the bytes. The integration lists
-`aiochainway==0.1.0` in `manifest.json` `requirements` and never builds frames
+`aiochainway==0.2.0` in `manifest.json` `requirements` and never builds frames
 itself.
 
 ## Division of work
@@ -116,6 +116,38 @@ entry.async_on_unload(listener.stop)
 
 ## Testing the integration
 
-Use `tests/fake_reader.py` from this repo as a template for a fake reader, or
-feed `TagPresence` directly with `TagRead` objects. `TagPresence(clock=…)`
-takes an injected clock, so no sleeps are needed.
+Use the fake reader that ships in the library, from the same pinned version
+as the client. It speaks the protocol that version implements, and this
+repo's CI checks that it answers every supported command with a reply the
+client's own parsers accept:
+
+```python
+from aiochainway import UR4Client, UR4UdpListener, TagPresence
+from aiochainway.testing import FakeUR4, tag_frames, tag_record
+
+
+async def test_config_flow_connects() -> None:
+    async with FakeUR4() as fake:  # 127.0.0.1, free port
+        async with UR4Client(fake.host, fake.port) as reader:
+            assert await reader.get_version() == "V1.2.3"
+
+
+async def test_reader_unreachable_shows_error() -> None:
+    async with FakeUR4() as fake:
+        fake.faults.drop = {"get_version"}  # reply never comes → ReaderTimeout
+        ...
+```
+
+* `fake.state` holds what the fake reports (version, network, power, region…);
+  writes from the client update it.
+* `fake.faults` injects delays, dropped or duplicated replies, corrupted XOR,
+  byte-by-byte writes, unsolicited tag frames, failure statuses and
+  disconnects.
+* `fake.tags` / `tag_record(...)` set the tags an inventory returns.
+* `tag_frames(...)` builds the bytes of one auto-mode UDP datagram; send it
+  to your `UR4UdpListener` with a plain UDP socket.
+* `fake.received` / `fake.names()` show what the integration sent, e.g. to
+  assert that provisioning set the UDP destination.
+
+For entity logic, feed `TagPresence` directly with `TagRead` objects;
+`TagPresence(clock=…)` takes an injected clock, so no sleeps are needed.

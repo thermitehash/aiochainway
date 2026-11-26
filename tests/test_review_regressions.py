@@ -23,13 +23,13 @@ from aiochainway import (
 from aiochainway.cli import async_main
 from aiochainway.protocol import commands as c
 from aiochainway.protocol.frame import Frame, encode
+from aiochainway.testing import FakeUR4, tag_record
 
 from .conftest import eventually
-from .fake_reader import FakeReader, tag_record
 
 
 async def test_cancelled_request_late_reply_goes_nowhere(
-    client: UR4Client, fake: FakeReader
+    client: UR4Client, fake: FakeUR4
 ) -> None:
     fake.faults.delay = 0.3
     task = asyncio.create_task(client.get_version())
@@ -43,7 +43,7 @@ async def test_cancelled_request_late_reply_goes_nowhere(
     assert await client.get_version() == "V2.2.2"
 
 
-async def test_slow_late_reply_after_timeout_goes_nowhere(fake: FakeReader) -> None:
+async def test_slow_late_reply_after_timeout_goes_nowhere(fake: FakeUR4) -> None:
     client = UR4Client("127.0.0.1", fake.port, timeout=0.3)
     await client.connect()
     fake.faults.delay = 0.5  # later than min(timeout, 1.0) used to be safe for
@@ -55,7 +55,7 @@ async def test_slow_late_reply_after_timeout_goes_nowhere(fake: FakeReader) -> N
     await client.close()
 
 
-async def test_stale_reply_that_never_comes_only_delays(fake: FakeReader) -> None:
+async def test_stale_reply_that_never_comes_only_delays(fake: FakeUR4) -> None:
     client = UR4Client("127.0.0.1", fake.port, timeout=0.2, stale_window=0.3)
     await client.connect()
     fake.faults.drop_next = 1
@@ -80,7 +80,7 @@ def test_set_ack_never_matches_get_reply() -> None:
 
 
 async def test_close_during_inventory_sends_stop(
-    client: UR4Client, fake: FakeReader
+    client: UR4Client, fake: FakeUR4
 ) -> None:
     stream = client.inventory()
     await stream.__anext__()
@@ -91,7 +91,7 @@ async def test_close_during_inventory_sends_stop(
 
 
 async def test_stop_inventory_connection_lost_is_not_cancellation(
-    fake: FakeReader,
+    fake: FakeUR4,
 ) -> None:
     client = UR4Client("127.0.0.1", fake.port, timeout=0.5, stop_drain=2.0)
     await client.connect()
@@ -109,7 +109,7 @@ async def test_stop_inventory_connection_lost_is_not_cancellation(
 
 
 async def test_stop_inventory_still_cancellable(
-    client: UR4Client, fake: FakeReader
+    client: UR4Client, fake: FakeUR4
 ) -> None:
     fake.faults.no_stop_ack = True
     client.stop_drain = 5
