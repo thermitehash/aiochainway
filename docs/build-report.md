@@ -2,8 +2,8 @@
 - Version: 0.1.0
 - Date: 2026-11-26
 - PR: https://github.com/thermitehash/aiochainway/pull/1
-- Commit: 8752bc6 (code); this report is committed on top of it
-- CI: CI_STATUS_PLACEHOLDER
+- Commit: 9f95019 (head of PR #1; code in 8752bc6, test and report fixes in ee4f27e and 9f95019)
+- CI: pass on 9f95019 for ubuntu-latest and macos-latest (pytest + coverage gates); Ruff + mypy --strict, build and version-bump jobs pass; mutation job is weekly only (92.3% locally)
 
 ## Summary
 This builds the whole `aiochainway` v0.1.0 library in one PR, with no hardware attached:
