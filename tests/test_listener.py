@@ -10,9 +10,9 @@ import pytest
 
 from aiochainway import TagRead, UR4UdpListener, ValidationError, discover
 from aiochainway.protocol.frame import encode
+from aiochainway.testing import tag_record
 
 from .conftest import eventually
-from .fake_reader import tag_record
 
 EPC = "E28011700000020A1B2C3D4E"
 

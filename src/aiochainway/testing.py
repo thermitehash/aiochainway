@@ -1,7 +1,25 @@
-"""An in-process fake UR4 for tests, with fault injection.
+"""In-process fake UR4 for tests, with fault injection.
 
-Replies are written out by hand from ``docs/protocol.md`` (not produced with
-the library's builders), so a library/spec disagreement shows up as a failure.
+Import it from the installed, pinned version so a downstream project (such as
+a Home Assistant integration) always tests against a fake that speaks the same
+protocol as the client it ships with::
+
+    from aiochainway import UR4Client
+    from aiochainway.testing import FakeUR4, tag_record
+
+    async with FakeUR4() as fake:
+        fake.tags = [tag_record("E2801170000002AA", antenna=2)]
+        async with UR4Client(fake.host, fake.port) as reader:
+            assert await reader.get_version() == "V1.2.3"
+            fake.faults.drop = {"get_region"}  # next get_region times out
+
+The fake's replies are written out by hand from ``docs/protocol.md`` rather
+than produced with the library's own builders, so a disagreement between the
+client and the documented protocol shows up as a test failure. The test suite
+also checks that the fake answers every command in
+:data:`aiochainway.protocol.commands.COMMANDS` that the UR4 supports.
+
+It needs only the standard library and opens sockets on ``127.0.0.1`` only.
 """
 
 from __future__ import annotations
@@ -10,8 +28,21 @@ import asyncio
 import contextlib
 from dataclasses import dataclass, field
 import ipaddress
+from types import TracebackType
+from typing import Self
 
-from aiochainway.protocol.frame import Frame, FrameDecoder, encode
+from .protocol.commands import CMD_TAG_REPORT
+from .protocol.errors import ValidationError
+from .protocol.frame import Frame, FrameDecoder, encode
+
+__all__ = [
+    "NAMES",
+    "FakeUR4",
+    "Faults",
+    "ReaderState",
+    "tag_frames",
+    "tag_record",
+]
 
 
 def tag_record(
@@ -22,17 +53,44 @@ def tag_record(
     tid: str | None = None,
     user: str | None = None,
 ) -> bytes:
-    """Build a ``0x83`` payload: PC | EPC | [TID | [USER]] | RSSI | ANT."""
-    epc_b = bytes.fromhex(epc)
-    assert len(epc_b) % 2 == 0 and len(epc_b) <= 62
+    """Build a ``0x83`` tag-report payload: PC | EPC | [TID | [USER]] | RSSI | ANT.
+
+    ``antenna`` is not range-checked, so tests can build invalid records (e.g.
+    antenna 9). ``rssi_dbm=None`` encodes a value the parser reports as ``None``.
+
+    Raises:
+        ValidationError: ``epc``/``tid``/``user`` are not hex, the EPC is not a
+            whole number of 16-bit words up to 62 bytes, or ``antenna`` is not
+            a byte.
+
+    """
+    try:
+        epc_b = bytes.fromhex(epc)
+        tid_b = bytes.fromhex(tid) if tid is not None else None
+        user_b = bytes.fromhex(user) if user is not None else None
+    except ValueError as err:
+        raise ValidationError(f"not hex: {err}") from err
+    if len(epc_b) % 2 or len(epc_b) > 62:
+        raise ValidationError("EPC must be an even number of bytes, at most 62")
+    if not 0 <= antenna <= 0xFF:
+        raise ValidationError(f"antenna must fit in a byte, got {antenna}")
     pc = bytes(((len(epc_b) // 2) << 3, 0x00))
     raw = 0x0000 if rssi_dbm is None else 0xFFFF - round(-rssi_dbm * 10)
     body = pc + epc_b
-    if tid is not None:
-        body += bytes.fromhex(tid)
-        if user is not None:
-            body += bytes.fromhex(user)
+    if tid_b is not None:
+        body += tid_b
+        if user_b is not None:
+            body += user_b
     return body + raw.to_bytes(2, "big") + bytes((antenna,))
+
+
+def tag_frames(*records: bytes) -> bytes:
+    """Return complete ``0x83`` frames for ``records``, back to back.
+
+    Send the result as one UDP datagram to exercise a listener the way a
+    reader in auto mode does.
+    """
+    return b"".join(encode(CMD_TAG_REPORT, record) for record in records)
 
 
 @dataclass
@@ -128,10 +186,17 @@ class ReaderState:
     )
 
 
-class FakeReader:
-    """TCP fake of the UR4 command port."""
+class FakeUR4:
+    """TCP fake of the UR4 command port.
+
+    Attributes you may change at any time: ``state`` (the settings it reports),
+    ``faults`` (fault injection), ``tags`` (records sent during an inventory,
+    cycled) and ``tag_interval`` (seconds between tag frames). ``received``
+    holds every frame received; :meth:`names` gives their command names.
+    """
 
     def __init__(self) -> None:
+        """Create a stopped fake; call :meth:`start` or use ``async with``."""
         self.state = ReaderState()
         self.faults = Faults()
         self.tags: list[bytes] = [tag_record("E28011700000020A1B2C3D4E")]
@@ -141,15 +206,35 @@ class FakeReader:
         self._server: asyncio.Server | None = None
         self._writers: set[asyncio.StreamWriter] = set()
         self._tasks: set[asyncio.Task[None]] = set()
+        self.host = "127.0.0.1"
         self.port = 0
+        # Replaced (after being set) on every new connection or frame.
+        self._activity = asyncio.Event()
 
     # Lifecycle -----------------------------------------------------------------
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> None:
+        """Listen on ``host:port`` (port 0 picks a free one; see ``self.port``)."""
         self._server = await asyncio.start_server(self._handle, host, port)
+        self.host = host
         self.port = self._server.sockets[0].getsockname()[1]
 
+    async def __aenter__(self) -> Self:
+        """Start on a free port on 127.0.0.1."""
+        await self.start()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        """Stop."""
+        await self.stop()
+
     async def stop(self) -> None:
+        """Close every connection and stop listening. Safe to call twice."""
         if self._server is not None:
             self._server.close()
         for writer in list(self._writers):
@@ -170,10 +255,14 @@ class FakeReader:
         """
         async with asyncio.timeout(timeout):
             while not self._writers:
-                await asyncio.sleep(0.005)
+                await self._activity.wait()
         for writer in list(self._writers):
             writer.close()
         await asyncio.sleep(0.01)
+
+    def _notify(self) -> None:
+        self._activity.set()
+        self._activity = asyncio.Event()
 
     def names(self) -> list[str]:
         """Names of every command received, in order."""
@@ -183,9 +272,10 @@ class FakeReader:
         ]
 
     async def wait_for(self, name: str, timeout: float = 1.0) -> None:
+        """Wait until a command called ``name`` has been received."""
         async with asyncio.timeout(timeout):
             while name not in self.names():
-                await asyncio.sleep(0.005)
+                await self._activity.wait()
 
     # Connection handling -------------------------------------------------------
 
@@ -194,11 +284,12 @@ class FakeReader:
     ) -> None:
         self.connections += 1
         self._writers.add(writer)
+        self._notify()
         decoder = FrameDecoder()
         conn = _Conn(self, writer)
         task = asyncio.current_task()
-        assert task is not None
-        self._tasks.add(task)
+        if task is not None:
+            self._tasks.add(task)
         try:
             while True:
                 data = await reader.read(4096)
@@ -206,22 +297,24 @@ class FakeReader:
                     break
                 for frame in decoder.feed(data):
                     self.received.append(frame)
+                    self._notify()
                     await conn.on_frame(frame)
                     if writer.is_closing():
                         return
-        except ConnectionError, asyncio.CancelledError:
-            pass
+        except ConnectionError:
+            pass  # the client went away; clean up below
         finally:
             await conn.stop_inventory_task()
             self._writers.discard(writer)
-            self._tasks.discard(task)
+            if task is not None:
+                self._tasks.discard(task)
             writer.close()
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(OSError, ConnectionError):
                 await writer.wait_closed()
 
 
 class _Conn:
-    def __init__(self, fake: FakeReader, writer: asyncio.StreamWriter) -> None:
+    def __init__(self, fake: FakeUR4, writer: asyncio.StreamWriter) -> None:
         self.fake = fake
         self.writer = writer
         self.inventory_task: asyncio.Task[None] | None = None

@@ -11,11 +11,10 @@ import pytest
 
 from aiochainway.cli import async_main, build_parser, main
 from aiochainway.protocol.frame import encode
+from aiochainway.testing import FakeUR4, tag_record
 
-from .fake_reader import FakeReader, tag_record
 
-
-async def run(fake: FakeReader | None, *args: str) -> tuple[int, str]:
+async def run(fake: FakeUR4 | None, *args: str) -> tuple[int, str]:
     out = io.StringIO()
     base = [
         "--host",
@@ -29,13 +28,13 @@ async def run(fake: FakeReader | None, *args: str) -> tuple[int, str]:
     return code, out.getvalue()
 
 
-async def test_version_and_json(fake: FakeReader) -> None:
+async def test_version_and_json(fake: FakeUR4) -> None:
     assert await run(fake, "version") == (0, "V1.2.3\n")
     code, out = await run(fake, "--json", "version")
     assert code == 0 and json.loads(out) == {"version": "V1.2.3"}
 
 
-async def test_info(fake: FakeReader) -> None:
+async def test_info(fake: FakeUR4) -> None:
     code, out = await run(fake, "--json", "info")
     data = json.loads(out)
     assert code == 0
@@ -50,13 +49,13 @@ async def test_info(fake: FakeReader) -> None:
     assert code == 0 and "beep" in out and "error:" in out
 
 
-async def test_mode(fake: FakeReader) -> None:
+async def test_mode(fake: FakeUR4) -> None:
     assert await run(fake, "mode") == (0, "command\n")
     assert await run(fake, "mode", "--set", "auto") == (0, "auto\n")
     assert fake.state.work_mode == 1
 
 
-async def test_inventory(fake: FakeReader, capsys: pytest.CaptureFixture[str]) -> None:
+async def test_inventory(fake: FakeUR4, capsys: pytest.CaptureFixture[str]) -> None:
     fake.tags = [
         tag_record("AABB", antenna=2),
         tag_record("CCDD", tid="00" * 12, antenna=1),
@@ -71,7 +70,7 @@ async def test_inventory(fake: FakeReader, capsys: pytest.CaptureFixture[str]) -
     assert fake.names()[-1] == "stop_inventory"
 
 
-async def test_antennas_power_region_beep(fake: FakeReader) -> None:
+async def test_antennas_power_region_beep(fake: FakeUR4) -> None:
     assert await run(fake, "antennas") == (0, "1,2,3,4\n")
     assert await run(fake, "antennas", "--set", "1,3") == (0, "1,3\n")
     code, out = await run(fake, "power", "--set", "20")
@@ -84,7 +83,7 @@ async def test_antennas_power_region_beep(fake: FakeReader) -> None:
     assert await run(fake, "beep", "--set", "off") == (0, "off\n")
 
 
-async def test_gpi_gpo_trigger(fake: FakeReader) -> None:
+async def test_gpi_gpo_trigger(fake: FakeUR4) -> None:
     assert await run(fake, "gpi") == (0, "input1=low input2=high\n")
     assert await run(fake, "gpo", "--relay", "1") == (0, "ok\n")
     assert fake.received[-1].data == b"\x09\x00\x00\x01"
@@ -102,7 +101,7 @@ async def test_gpi_gpo_trigger(fake: FakeReader) -> None:
     assert code == 0 and "gpi=2 work_time=50x10ms" in out and "report=serial" in out
 
 
-async def test_network_and_destination_guard(fake: FakeReader) -> None:
+async def test_network_and_destination_guard(fake: FakeUR4) -> None:
     code, out = await run(fake, "network")
     assert (code, out) == (
         0,
@@ -142,13 +141,13 @@ async def test_network_and_destination_guard(fake: FakeReader) -> None:
     assert (await run(fake, "destination", "--set"))[0] == 2
 
 
-async def test_factory_reset_guard(fake: FakeReader) -> None:
+async def test_factory_reset_guard(fake: FakeUR4) -> None:
     assert (await run(fake, "factory-reset"))[0] == 5
     assert (await run(fake, "factory-reset", "--confirm"))[0] == 0
     assert fake.names() == ["factory_reset"]
 
 
-async def test_provision_dry_run_and_confirm(fake: FakeReader) -> None:
+async def test_provision_dry_run_and_confirm(fake: FakeUR4) -> None:
     args = [
         "provision",
         "--udp-dest",
@@ -171,7 +170,7 @@ async def test_provision_dry_run_and_confirm(fake: FakeReader) -> None:
     assert steps[-1]["message"] == "Done."
 
 
-async def test_exit_codes(fake: FakeReader) -> None:
+async def test_exit_codes(fake: FakeUR4) -> None:
     fake.faults.drop = {"get_version"}
     assert (await run(fake, "version"))[0] == 3
     fake.faults.fail = {"set_region"}
@@ -226,7 +225,7 @@ async def test_discover_none() -> None:
 
 
 async def test_debug_hex_dump(
-    fake: FakeReader, capsys: pytest.CaptureFixture[str]
+    fake: FakeUR4, capsys: pytest.CaptureFixture[str]
 ) -> None:
     import logging
 

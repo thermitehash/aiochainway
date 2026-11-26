@@ -14,11 +14,10 @@ from aiochainway import (
     provision,
 )
 from aiochainway.setup import make_target, plan
+from aiochainway.testing import FakeUR4
 
-from .fake_reader import FakeReader
 
-
-async def test_dry_run_sends_nothing(fake: FakeReader) -> None:
+async def test_dry_run_sends_nothing(fake: FakeUR4) -> None:
     result = await provision(
         "127.0.0.1",
         port=fake.port,
@@ -46,14 +45,14 @@ async def test_dry_run_sends_nothing(fake: FakeReader) -> None:
     assert result.steps[0].frame_hex == "A5 5A 00 08 8C 84 0D 0A"
 
 
-async def test_requires_confirm_for_network_steps(fake: FakeReader) -> None:
+async def test_requires_confirm_for_network_steps(fake: FakeUR4) -> None:
     with pytest.raises(UnsafeOperationError):
         await provision("127.0.0.1", port=fake.port, udp_dest=("192.168.99.100", 8888))
     assert fake.connections == 0
 
 
 async def test_provision_applies_in_order_and_skips_already_set(
-    fake: FakeReader,
+    fake: FakeUR4,
 ) -> None:
     result = await provision(
         "127.0.0.1",
@@ -94,7 +93,7 @@ async def test_provision_applies_in_order_and_skips_already_set(
     assert result.network_changed and "192.168.99.50" in result.message
 
 
-async def test_provision_failure_stops_and_reports(fake: FakeReader) -> None:
+async def test_provision_failure_stops_and_reports(fake: FakeUR4) -> None:
     fake.faults.fail = {"set_antennas"}
     with pytest.raises(ReaderError) as info:
         await provision(
@@ -105,7 +104,7 @@ async def test_provision_failure_stops_and_reports(fake: FakeReader) -> None:
     assert "set_power" not in fake.names()
 
 
-async def test_provision_mode_only(fake: FakeReader) -> None:
+async def test_provision_mode_only(fake: FakeUR4) -> None:
     result = await provision("127.0.0.1", port=fake.port, timeout=0.5)
     assert [s.name for s in result.sent] == ["stop_inventory", "set_work_mode"]
     assert result.message == "Done."
@@ -113,7 +112,7 @@ async def test_provision_mode_only(fake: FakeReader) -> None:
     assert [s.outcome for s in result.steps] == ["sent", "skipped"]
 
 
-async def test_provision_reads_failing_still_applies(fake: FakeReader) -> None:
+async def test_provision_reads_failing_still_applies(fake: FakeUR4) -> None:
     fake.faults.drop = {"get_work_mode"}
     result = await provision(
         "127.0.0.1", port=fake.port, work_mode=WorkMode.AUTO, timeout=0.3

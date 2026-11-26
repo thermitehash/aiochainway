@@ -17,6 +17,7 @@ and UDP auto-mode inventory, no dependencies.
 * `TagPresence`: pure presence tracking (first/last seen, RSSI, antennas, TTL)
 * `provision()`: guarded, ordered setup for auto mode (IP change last)
 * `aiochainway` CLI that runs on macOS and Linux
+* `aiochainway.testing.FakeUR4`: a fake reader for your own tests
 
 ## Install
 
@@ -108,6 +109,22 @@ reader-reported failure, `5` unsafe operation refused (missing `--confirm`).
 
 On macOS, the first `listen` may trigger a firewall prompt. Click **Allow**, or
 UDP frames are silently dropped.
+
+## Testing code that uses aiochainway
+
+`aiochainway.testing` ships an in-process fake reader with fault injection,
+in sync with the protocol of the version you pin:
+
+```python
+from aiochainway import UR4Client
+from aiochainway.testing import FakeUR4, tag_record
+
+async with FakeUR4() as fake:
+    fake.tags = [tag_record("E2801170000002AA", antenna=2)]
+    fake.faults.delay = 0.2
+    async with UR4Client(fake.host, fake.port) as reader:
+        print([t.epc async for t in reader.inventory(duration=1)])
+```
 
 ## Network setup
 

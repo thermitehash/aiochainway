@@ -11,8 +11,7 @@ from hypothesis import HealthCheck, settings
 import pytest
 
 from aiochainway import UR4Client
-
-from .fake_reader import FakeReader
+from aiochainway.testing import FakeUR4
 
 settings.register_profile("dev", max_examples=200, deadline=None)
 settings.register_profile(
@@ -41,15 +40,15 @@ async def no_leaked_tasks() -> AsyncIterator[None]:
 
 
 @pytest.fixture
-async def fake() -> AsyncIterator[FakeReader]:
-    reader = FakeReader()
+async def fake() -> AsyncIterator[FakeUR4]:
+    reader = FakeUR4()
     await reader.start()
     yield reader
     await reader.stop()
 
 
 @pytest.fixture
-async def client(fake: FakeReader) -> AsyncIterator[UR4Client]:
+async def client(fake: FakeUR4) -> AsyncIterator[UR4Client]:
     c = UR4Client("127.0.0.1", fake.port, timeout=0.5, stop_drain=0.2)
     await c.connect()
     yield c
