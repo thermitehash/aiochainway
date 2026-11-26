@@ -1,0 +1,112 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aiochainway"
+version = "0.1.0"
+description = "Async Python library for Chainway UR4 fixed UHF RFID readers. TCP command and UDP auto-mode inventory, no dependencies. Unofficial; not affiliated with Chainway."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.14"
+authors = [{ name = "thermitehash" }]
+keywords = ["rfid", "uhf", "chainway", "ur4", "asyncio", "home-assistant"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Home Automation",
+    "Topic :: System :: Hardware",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "hypothesis==6.170.17",
+    "mutmut==3.8.1",
+    "mypy==2.4.1",
+    "pytest==9.2.0",
+    "pytest-asyncio==1.5.0",
+    "pytest-cov==7.1.0",
+    "ruff==0.17.6",
+]
+
+[project.scripts]
+aiochainway = "aiochainway.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/thermitehash/aiochainway"
+Issues = "https://github.com/thermitehash/aiochainway/issues"
+Changelog = "https://github.com/thermitehash/aiochainway/tree/main/docs/releases"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aiochainway"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/aiochainway", "tests", "docs", "README.md", "LICENSE"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP", "SIM", "RUF", "ASYNC", "PL", "TID", "D", "BLE", "S110", "S112"]
+ignore = ["TID252", "ASYNC109", "RUF001", "RUF002", "RUF003", "E501", "D203", "D213", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR2004", "RUF012"]
+
+[tool.ruff.lint.per-file-ignores]
+"script/**" = ["D", "S603", "S607"]
+"tests/**" = ["PLW0108", "ASYNC110", "ASYNC240", "ASYNC109", "D", "PLC0415", "PLR0917", "S101", "BLE001", "PLW0603"]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+known-first-party = ["aiochainway"]
+combine-as-imports = true
+
+[tool.mypy]
+strict = true
+python_version = "3.14"
+files = ["src", "tests"]
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["hypothesis.*"]
+follow_untyped_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+filterwarnings = [
+    "error::pytest.PytestUnraisableExceptionWarning",
+    "error::RuntimeWarning",
+    "error::ResourceWarning",
+]
+
+[tool.coverage.run]
+source = ["aiochainway"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "@overload"]
+
+[tool.mutmut]
+source_paths = ["src/aiochainway/protocol/"]
+also_copy = ["src/aiochainway/", "tests/"]
+pytest_add_cli_args_test_selection = [
+    "tests/test_frame.py",
+    "tests/test_commands.py",
+    "tests/test_tags.py",
+    "tests/test_fuzz.py",
+    "tests/test_models.py",
+    "tests/test_protocol_edges.py",
+]
+pytest_add_cli_args = ["-q", "-x", "-p", "no:cacheprovider"]

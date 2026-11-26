@@ -1,0 +1,94 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Ruff + mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: pip install -e ".[dev]"
+      - run: ruff format --check .
+      - run: ruff check .
+      - run: mypy --strict
+
+  tests:
+    name: Pytest (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      HYPOTHESIS_PROFILE: ci
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e ".[dev]"
+      - name: Tests with coverage
+        run: python -m pytest -q --cov=aiochainway --cov-branch --cov-report=term-missing --cov-fail-under=85
+      - name: Coverage gate for protocol/ and presence.py (95%)
+        run: python -m coverage report --include="*/aiochainway/protocol/*,*/aiochainway/presence.py" --fail-under=95
+      - name: CLI smoke test
+        run: |
+          aiochainway --version
+          test "$(aiochainway encode stop_inventory)" = "A5 5A 00 08 8C 84 0D 0A"
+          test "$(aiochainway encode get_work_mode)" = "A5 5A 00 09 A1 06 AE 0D 0A"
+
+  version:
+    name: Version bump
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: python script/check_version_bump.py "origin/${{ github.base_ref }}"
+
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: pip install build
+      - run: python -m build
+      - name: Wheel has py.typed and no vendor files
+        run: |
+          unzip -l dist/*.whl | grep -q "aiochainway/py.typed"
+          ! unzip -l dist/*.whl | grep -qi vendor
+          ! tar tzf dist/*.tar.gz | grep -qi vendor
+
+  mutation:
+    name: Mutation testing (protocol/)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: pip install -e ".[dev]"
+      - run: mutmut run --max-children 4
+      - run: python script/mutation_score.py 85
