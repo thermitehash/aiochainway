@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 import gc
 import os
 
@@ -54,3 +54,14 @@ async def client(fake: FakeReader) -> AsyncIterator[UR4Client]:
     await c.connect()
     yield c
     await c.close()
+
+
+async def eventually(condition: Callable[[], object], timeout: float = 3.0) -> None:
+    """Wait until ``condition()`` is truthy; fail after ``timeout`` seconds.
+
+    Use instead of fixed sleeps when waiting for an asynchronous effect, which
+    can take much longer on a busy CI runner (macOS especially).
+    """
+    async with asyncio.timeout(timeout):
+        while not condition():
+            await asyncio.sleep(0.005)

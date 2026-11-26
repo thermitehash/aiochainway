@@ -11,6 +11,7 @@ import pytest
 from aiochainway import TagRead, UR4UdpListener, ValidationError, discover
 from aiochainway.protocol.frame import encode
 
+from .conftest import eventually
 from .fake_reader import tag_record
 
 EPC = "E28011700000020A1B2C3D4E"
@@ -115,7 +116,7 @@ async def test_async_callback_and_its_errors(caplog: pytest.LogCaptureFixture) -
     with caplog.at_level(logging.ERROR, logger="aiochainway"):
         send(port, encode(0x83, tag_record(EPC)), encode(0x83, tag_record("AABB")))
         await settle(listener, 2)
-        await asyncio.sleep(0.02)
+        await eventually(lambda: listener.stats.callback_errors == 1)
     assert seen == [EPC, "AABB"]
     assert listener.stats.callback_errors == 1
     await listener.stop()

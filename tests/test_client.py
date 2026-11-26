@@ -37,6 +37,7 @@ from aiochainway.client import check_guard
 from aiochainway.protocol import commands as c
 from aiochainway.protocol.frame import Frame
 
+from .conftest import eventually
 from .fake_reader import FakeReader, tag_record
 
 EPC = "E28011700000020A1B2C3D4E"
@@ -220,8 +221,7 @@ async def test_delayed_reply_beyond_timeout_is_not_misassigned(
     # The late 0x03 reply lands during the quarantine and is dropped; the
     # retry gets its own reply.
     assert await client.get_version() == "V1.2.3"
-    await asyncio.sleep(0.3)
-    assert client.unmatched_frames >= 1
+    await eventually(lambda: client.unmatched_frames >= 1)
     assert await client.get_work_mode() is WorkMode.COMMAND
 
 
@@ -261,6 +261,7 @@ async def test_duplicate_replies_are_dropped(
     assert await client.get_version() == "V1.2.3"
     assert await client.get_work_mode() is WorkMode.COMMAND
     assert await client.get_region() is FrequencyRegion.USA
+    await eventually(lambda: client.unmatched_frames == 3)
     await asyncio.sleep(0.05)
     assert client.unmatched_frames == 3
 
@@ -322,9 +323,8 @@ async def test_disconnect_fails_pending_and_calls_callback(fake: FakeReader) -> 
     fake.faults.disconnect_on = {"get_version"}
     with pytest.raises(ConnectionLostError):
         await client.get_version()
-    await asyncio.sleep(0.01)
+    await eventually(lambda: len(lost) == 1)
     assert not client.connected
-    assert len(lost) == 1
     fake.faults.disconnect_on = set()
     await client.reconnect(attempts=3, base_delay=0.01)
     assert is_connected(client)  # helper: mypy narrowed .connected above
@@ -345,8 +345,7 @@ async def test_callback_exception_is_logged(
     await client.connect()
     with caplog.at_level(logging.ERROR, logger="aiochainway"):
         await fake.drop_connections()
-        await asyncio.sleep(0.05)
-    assert "on_disconnect callback raised" in caplog.text
+        await eventually(lambda: "on_disconnect callback raised" in caplog.text)
     await client.close()
 
 
@@ -510,8 +509,7 @@ async def test_inventory_queue_overflow_drops_oldest(fake: FakeReader) -> None:
     stream = client.inventory(duration=1)
     async with stream:
         await stream.__anext__()
-        await asyncio.sleep(0.05)
-        assert stream.dropped > 0
+        await eventually(lambda: stream.dropped > 0)
     await client.close()
 
 
@@ -566,7 +564,7 @@ async def test_cancel_during_request_leaves_client_usable(
     assert not client._lock.locked()
     assert client._pending is None
     fake.faults.delay = 0
-    await asyncio.sleep(0.25)  # let the late reply arrive and be dropped
+    await eventually(lambda: client.unmatched_frames == 1)  # late reply dropped
     assert await client.get_version() == "V1.2.3"
     assert client.unmatched_frames == 1
 
@@ -595,7 +593,7 @@ async def test_close_during_inventory(client: UR4Client) -> None:
 async def test_write_failure_maps_to_connection_lost(client: UR4Client) -> None:
     assert client._writer is not None
     client._writer.transport.abort()
-    await asyncio.sleep(0.01)
+    await eventually(lambda: not client.connected)
     with contextlib.suppress(ConnectionLostError):
         await client.get_version()
     assert not client.connected

@@ -24,6 +24,7 @@ from aiochainway.cli import async_main
 from aiochainway.protocol import commands as c
 from aiochainway.protocol.frame import Frame, encode
 
+from .conftest import eventually
 from .fake_reader import FakeReader, tag_record
 
 
@@ -207,6 +208,5 @@ async def test_listener_bounds_running_async_callbacks(
     assert listener.stats.callbacks_dropped == 2
     assert len(listener._tasks) == 3
     gate.set()
-    await asyncio.sleep(0.01)
-    assert not listener._tasks
+    await eventually(lambda: not listener._tasks)
     await listener.stop()
