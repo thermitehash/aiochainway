@@ -161,7 +161,16 @@ class FakeReader:
             await self._server.wait_closed()
             self._server = None
 
-    async def drop_connections(self) -> None:
+    async def drop_connections(self, timeout: float = 3.0) -> None:
+        """Close every client connection.
+
+        A client's connect() returns once the kernel finishes the handshake,
+        which can be before this server's accept handler runs (seen on macOS),
+        so wait for at least one registered connection first.
+        """
+        async with asyncio.timeout(timeout):
+            while not self._writers:
+                await asyncio.sleep(0.005)
         for writer in list(self._writers):
             writer.close()
         await asyncio.sleep(0.01)

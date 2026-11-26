@@ -161,7 +161,7 @@ Every command layout was resolved with `javap` from `ReaderAPI20240822.jar`, the
 | 16 | self-review | listener.py | ERROR log with traceback for every failing callback (log spam) | first + every 1000th at ERROR, rest at DEBUG | ::test_listener_callback_errors_are_rate_limited |
 | 17 | self-review | client.py | `duration=nan` never ended | `not duration > 0` | ::test_nan_duration_rejected |
 | 18 | self-review | listener.py | unbounded async callback tasks under a UDP flood | cap 1000 running, count `callbacks_dropped` | ::test_listener_bounds_running_async_callbacks |
-| 19 | test (CI, macOS) | tests | timing flake: a fixed 50 ms sleep was shorter than macOS's disconnect detection | `eventually()` polling helper replaces fixed sleeps that wait for async effects | test_client::test_callback_exception_is_logged (+8 tests) |
+| 19 | test (CI, macOS) | tests/fake_reader.py | race in the fake: `connect()` returns after the kernel handshake, before the fake server's accept handler registers the connection (macOS), so `drop_connections()` closed nothing | `drop_connections()` waits for a registered connection; `eventually()` replaces fixed sleeps that wait for async effects | test_client::test_callback_exception_is_logged |
 
 ## Risks for hardware bring-up
 1. **Auto mode may stop TCP command handling.** Provisioning sets auto mode before the IP. If the reader ignores TCP in auto mode, the IP step fails. *Covered:* hardware-validation §C tests auto ↔ command on the bench before any IP change, and the bring-up guide provisions without `--new-ip` first.
