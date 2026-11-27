@@ -11,7 +11,8 @@ and UDP auto-mode inventory, no dependencies.
 
 * asyncio, Python 3.14+, zero runtime dependencies, fully typed (`py.typed`)
 * `UR4Client`: TCP command channel, one request in flight, timeouts everywhere,
-  reconnect with backoff, inventory that **always** sends stop
+  reconnect with backoff, optional keepalive and auto-reconnect, sweeps that
+  **always** send stop and report a `SweepResult` (completed or why not)
 * `UR4UdpListener`: auto/trigger-mode tag frames over UDP, multiple frames per
   datagram, source filtering, a callback that can't crash the listener
 * `TagPresence`: pure presence tracking (first/last seen, RSSI, antennas, TTL)
@@ -38,8 +39,10 @@ async def main() -> None:
     async with UR4Client("192.168.99.202") as reader:
         print(await reader.get_version())
         print(await reader.get_power_all())
-        async for tag in reader.inventory(duration=5):
-            print(tag.epc, tag.rssi_dbm, tag.antenna)
+        async with reader.inventory(duration=5) as sweep:
+            async for tag in sweep:
+                print(tag.epc, tag.rssi_dbm, tag.antenna)
+        print(sweep.result.end_reason, sweep.result.unique_count)
 
 
 asyncio.run(main())
@@ -90,7 +93,10 @@ Global options: `--host` (or `AIOCHAINWAY_HOST`), `--port`, `--timeout`,
 | `version` | firmware version |
 | `info` | version, temperature, mode, network, destination, antennas, power, region, beep |
 | `mode [--set command\|auto\|trigger]` | work mode |
-| `inventory [--seconds N] [--unique]` | read tags over TCP |
+| `inventory [--seconds N] [--unique] [--stop-first]` | read tags over TCP; prints a sweep summary |
+| `sweep [--seconds 45] [--repeat 10] [--pause 5]` | repeated sweeps with unique-EPC variance |
+| `ping [--count N]` | round-trip latency |
+| `idle [--minutes 60]` | does the reader drop an idle TCP session? |
 | `listen [--port P] [--source IP] [--seconds N]` | receive auto-mode tags over UDP |
 | `antennas [--set 1,2]` | enabled antennas |
 | `power [--set DBM] [--antenna N]` | antenna power, 1–30 dBm |

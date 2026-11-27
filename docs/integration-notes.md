@@ -2,7 +2,7 @@
 
 The pantry integration (Home Assistant, HACS) owns entities, the config flow and
 inventory logic. `aiochainway` owns the bytes. The integration lists
-`aiochainway==0.2.0` in `manifest.json` `requirements` and never builds frames
+`aiochainway==0.3.0` in `manifest.json` `requirements` and never builds frames
 itself.
 
 ## Division of work
@@ -93,6 +93,60 @@ entry.async_on_unload(listener.stop)
 * For a "scan now" button in command mode, use
   `async for tag in reader.inventory(duration=3)`. The library always sends stop.
 
+## Door-driven sweeps in command mode (Pantry Hub v0.3.0)
+
+Instead of auto mode, the integration can run a timed sweep over TCP when a
+door closes, and treat the result as the cabinet's contents:
+
+```python
+from aiochainway import SweepEndReason, UR4Client
+
+client = UR4Client(
+    host,
+    keepalive_interval_s=300,  # or None, and connect per sweep (see below)
+    auto_reconnect=True,
+    stop_on_connect=True,  # clears a reader left running by a crashed HA
+    on_disconnect=lambda err: ...,  # mark entities unavailable
+    on_reconnect=lambda: ...,  # mark available again
+)
+await client.connect(retries=3)
+
+
+async def on_door_closed() -> None:
+    async with client.inventory(duration=45) as sweep:
+        async for tag in sweep:
+            ...  # optional live updates
+    result = sweep.result
+    if result is None or not result.completed:
+        # stopped / connection_lost / error: keep the previous contents
+        return
+    apply_contents(result.unique_epcs, result.per_antenna_counts)
+```
+
+* **Only a `completed` sweep (`end_reason == "duration_elapsed"`) is a full
+  read of the cabinet.** Anything else is partial; don't mark items as gone
+  because of it.
+* `result.stop_acknowledged` is false if the reader didn't confirm stop in
+  time. The sweep is still valid; log it, and consider `stop_on_connect` or an
+  explicit `await client.stop_inventory()` before the next sweep.
+* Leaving the `async with` block always sends stop and waits for the ack
+  (bounded by `stop_drain`, default = `timeout`). If the door opens again
+  mid-sweep, just leave the block: the result says `stopped`.
+* Only one sweep at a time per client: a second `inventory()` raises
+  `UnsafeOperationError`. Debounce door events.
+* `result.unique_epcs` is a set of EPC hex strings; `reports` counts every
+  read (repeats included); `per_antenna_counts` tells which shelf saw how
+  much.
+* **Long idle periods:** whether the UR4 drops idle TCP sessions is not known
+  yet (hardware-validation §E.2). Either keep the connection with
+  `keepalive_interval_s` (a ping that times out drops the link so
+  `auto_reconnect` replaces it), or connect per sweep:
+  `async with UR4Client(host, stop_on_connect=True) as c: async with c.inventory(45) as s: ...`.
+* `await client.ping()` returns the round-trip in seconds; good for a
+  diagnostic sensor.
+
+Test all of this with `FakeUR4` scenarios (see "Testing the integration").
+
 ## Errors to handle
 
 | Exception | Meaning | Suggested HA handling |
@@ -148,6 +202,27 @@ async def test_reader_unreachable_shows_error() -> None:
   to your `UR4UdpListener` with a plain UDP socket.
 * `fake.received` / `fake.names()` show what the integration sent, e.g. to
   assert that provisioning set the UDP destination.
+* `fake.scenario = [ScriptedTag(...), ...]` scripts sweeps: tags present
+  from/until a time on the fake's scenario clock (`fake.elapsed()`), a
+  per-tag `read_probability` for edge-of-field flicker (seeded:
+  `FakeUR4(seed=…)`), and per-tag `antennas` (only enabled ports report).
+* Sweep faults: `faults.disconnect_after_s` (drop mid-sweep),
+  `faults.stop_ack_delay` / `faults.no_stop_ack`, and `faults.idle_timeout_s`
+  (the fake closes idle connections, to test keepalive and reconnect).
+
+```python
+from aiochainway.testing import FakeUR4, ScriptedTag
+
+
+async def test_item_removed_between_sweeps() -> None:
+    async with FakeUR4(seed=1) as fake:
+        fake.scenario = [
+            ScriptedTag("E2801170000002AA", antennas=(1,)),
+            ScriptedTag("E2801170000002BB", present_until=1.0),  # taken out
+            ScriptedTag("E2801170000002CC", read_probability=0.4),  # flickers
+        ]
+        ...
+```
 
 For entity logic, feed `TagPresence` directly with `TagRead` objects;
 `TagPresence(clock=…)` takes an injected clock, so no sleeps are needed.

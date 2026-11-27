@@ -15,6 +15,7 @@ from enum import Enum
 import json
 import logging
 import os
+import statistics
 import sys
 import time
 from typing import Any, TextIO
@@ -27,6 +28,7 @@ from .models import (
     FrequencyRegion,
     GpoState,
     ReaderNetworkConfig,
+    SweepResult,
     TagRead,
     TriggerConfig,
     TriggerReport,
@@ -203,6 +205,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="how long to read (default %(default)s)",
     )
     p.add_argument("--unique", action="store_true", help="print each EPC once")
+    p.add_argument(
+        "--stop-first",
+        action="store_true",
+        help="send stop inventory on connect (clears a reader left running)",
+    )
+
+    p = sub.add_parser("ping", help="firmware-version round trip; print latency")
+    p.add_argument("--count", type=int, default=1)
+
+    p = sub.add_parser(
+        "sweep",
+        help="repeat timed sweeps and summarise them (hardware validation §E)",
+    )
+    p.add_argument("--seconds", type=float, default=45.0)
+    p.add_argument("--repeat", type=int, default=10)
+    p.add_argument("--pause", type=float, default=5.0, help="seconds between sweeps")
+
+    p = sub.add_parser(
+        "idle",
+        help="hold an idle connection, then ping (does the reader drop idle TCP?)",
+    )
+    p.add_argument("--minutes", type=float, default=60.0)
 
     p = sub.add_parser(
         "listen",
@@ -518,15 +542,25 @@ async def _cmd_reader(args: argparse.Namespace, out: Output) -> int:
                 mode = await reader.get_work_mode()
                 out.emit(mode.name.lower(), {"work_mode": mode})
             case "inventory":
-                seen: dict[str, int] = {}
-                async for tag in reader.inventory(duration=args.seconds):
-                    seen[tag.epc] = seen.get(tag.epc, 0) + 1
-                    if args.unique and seen[tag.epc] > 1:
-                        continue
-                    out.emit(_tag_line(tag), tag)
-                sys.stderr.write(
-                    f"{sum(seen.values())} read(s), {len(seen)} unique EPC(s)\n"
-                )
+                if args.stop_first:
+                    await reader.stop_inventory()
+                seen: set[str] = set()
+                async with reader.inventory(duration=args.seconds) as sweep:
+                    async for tag in sweep:
+                        if args.unique and tag.epc in seen:
+                            continue
+                        seen.add(tag.epc)
+                        out.emit(_tag_line(tag), tag)
+                if sweep.result is not None:
+                    sys.stderr.write(_sweep_line(sweep.result) + "\n")
+            case "ping":
+                for _ in range(max(1, args.count)):
+                    latency = await reader.ping()
+                    out.emit(f"{latency * 1000:.1f} ms", {"latency_s": latency})
+            case "sweep":
+                await _cmd_sweeps(reader, args, out)
+            case "idle":
+                await _cmd_idle(reader, args, out)
             case "antennas":
                 if args.set is not None:
                     await reader.set_antennas(args.set)
@@ -624,6 +658,78 @@ async def _cmd_reader(args: argparse.Namespace, out: Output) -> int:
             case _:  # pragma: no cover - argparse enforces the choices
                 raise UsageError(f"unknown command {cmd}")
     return EXIT_OK  # fmt: skip
+
+
+def _sweep_line(result: SweepResult) -> str:
+    ants = " ".join(f"ant{a}={n}" for a, n in result.per_antenna_counts.items())
+    elapsed = f"{result.elapsed:.1f}s" if result.elapsed is not None else "-"
+    ack = "acked" if result.stop_acknowledged else "no-ack"
+    return (
+        f"{result.end_reason}: {result.unique_count} unique EPC(s), "
+        f"{result.reports} report(s) in {elapsed} [{ants or 'no reads'}] stop {ack}"
+    )
+
+
+async def _cmd_sweeps(reader: UR4Client, args: argparse.Namespace, out: Output) -> None:
+    """Run ``--repeat`` sweeps of ``--seconds`` and print unique-EPC variance."""
+    counts: list[int] = []
+    all_epcs: set[str] = set()
+    every: set[str] | None = None
+    for n in range(1, max(1, args.repeat) + 1):
+        async with reader.inventory(duration=args.seconds) as sweep:
+            async for _ in sweep:
+                pass
+        result = sweep.result
+        if result is None:  # pragma: no cover - always set after the block
+            continue
+        counts.append(result.unique_count)
+        all_epcs |= result.unique_epcs
+        every = set(result.unique_epcs) if every is None else every & result.unique_epcs
+        out.emit(f"sweep {n}: {_sweep_line(result)}", {"sweep": n, "result": result})
+        if n < args.repeat:
+            await asyncio.sleep(args.pause)
+    mean = statistics.fmean(counts)
+    var = statistics.pvariance(counts) if len(counts) > 1 else 0.0
+    summary = {
+        "sweeps": len(counts),
+        "unique_min": min(counts),
+        "unique_max": max(counts),
+        "unique_mean": round(mean, 2),
+        "unique_variance": round(var, 3),
+        "epcs_seen_any": len(all_epcs),
+        "epcs_seen_every": len(every or ()),
+    }
+    out.emit(
+        "summary: " + ", ".join(f"{k}={v}" for k, v in summary.items()),
+        {"summary": summary},
+    )
+
+
+async def _cmd_idle(reader: UR4Client, args: argparse.Namespace, out: Output) -> None:
+    """Stay idle for ``--minutes``, then ping; report if/when the link dropped."""
+    started = time.monotonic()
+    dropped_after: list[float] = []
+    dropped = asyncio.Event()
+
+    def on_drop(_: BaseException | None) -> None:
+        dropped_after.append(time.monotonic() - started)
+        dropped.set()
+
+    reader.on_disconnect = on_drop
+    sys.stderr.write(f"Idle for {args.minutes:g} min; no traffic will be sent...\n")
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(dropped.wait(), args.minutes * 60)
+    if dropped_after:
+        out.emit(
+            f"dropped by the reader after {dropped_after[0]:.0f} s idle",
+            {"survived": False, "dropped_after_s": dropped_after[0]},
+        )
+        return
+    latency = await reader.ping()
+    out.emit(
+        f"survived {args.minutes:g} min idle; ping {latency * 1000:.1f} ms",
+        {"survived": True, "idle_s": args.minutes * 60, "latency_s": latency},
+    )
 
 
 def _configure_logging(debug: bool) -> None:

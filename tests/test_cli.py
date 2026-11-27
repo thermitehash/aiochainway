@@ -278,3 +278,47 @@ def test_parser_has_every_subcommand() -> None:
 def test_main_entry_point(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["encode", "stop_inventory"]) == 0
     assert capsys.readouterr().out == "A5 5A 00 08 8C 84 0D 0A\n"
+
+
+async def test_inventory_summary_and_stop_first(
+    fake: FakeUR4, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, _ = await run(fake, "inventory", "--seconds", "0.1", "--stop-first")
+    assert code == 0
+    assert fake.names()[0] == "stop_inventory"
+    err = capsys.readouterr().err
+    assert "duration_elapsed:" in err and "stop acked" in err
+
+
+async def test_ping_cli(fake: FakeUR4) -> None:
+    code, out = await run(fake, "ping", "--count", "2")
+    assert code == 0 and out.count(" ms") == 2
+    code, out = await run(fake, "--json", "ping")
+    assert json.loads(out)["latency_s"] >= 0
+
+
+async def test_sweep_cli_repeatability_summary(fake: FakeUR4) -> None:
+    from aiochainway.testing import ScriptedTag
+
+    fake.scenario = [ScriptedTag("AA01"), ScriptedTag("AA02", read_probability=0.5)]
+    code, out = await run(
+        fake, "--json", "sweep", "--seconds", "0.05", "--repeat", "3", "--pause", "0"
+    )
+    assert code == 0
+    lines = [json.loads(line) for line in out.splitlines()]
+    assert [line["sweep"] for line in lines[:3]] == [1, 2, 3]
+    assert lines[0]["result"]["end_reason"] == "duration_elapsed"
+    summary = lines[-1]["summary"]
+    assert summary["sweeps"] == 3 and summary["epcs_seen_every"] >= 1
+    assert summary["unique_min"] <= summary["unique_mean"] <= summary["unique_max"]
+    code, out = await run(fake, "sweep", "--seconds", "0.05", "--repeat", "1")
+    assert "summary: sweeps=1" in out and "unique_variance=0.0" in out
+
+
+async def test_idle_cli(fake: FakeUR4) -> None:
+    code, out = await run(fake, "idle", "--minutes", "0.003")
+    assert code == 0 and "survived" in out
+    fake.faults.idle_timeout_s = 0.1
+    code, out = await run(fake, "--json", "idle", "--minutes", "0.05")
+    data = json.loads(out)
+    assert code == 0 and data["survived"] is False and data["dropped_after_s"] < 1
