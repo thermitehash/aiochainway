@@ -1,25 +1,32 @@
 # aiochainway build report
-- Version: 0.3.0
+- Version: 0.4.0
 - Date: 2026-11-27
-- PR: https://github.com/thermitehash/aiochainway/pull/3 (v0.3.0); earlier: #1 (v0.1.0), #2 (v0.2.0)
-- Commit: 83aba79 (v0.3.0 code; this report is committed on top)
-- CI: on 83aba79, Ruff + mypy --strict, build and version-bump pass; pytest ubuntu-latest and macos-latest were still running when this report was committed (see PR #3 checks)
+- PR: https://github.com/thermitehash/aiochainway/pull/4 (v0.4.0); earlier: #1 (v0.1.0), #2 (v0.2.0), #3 (v0.3.0)
+- Commit: see PR #4 (squash-merged to main; release.yml tags v0.4.0)
+- CI: Ruff + mypy --strict, pytest on ubuntu-latest and macos-latest, build, version-bump and mutation jobs (see PR #4 checks)
 
 ## Summary
-v0.3.0 adds door-driven command-mode sweeps for Pantry Hub v0.3.0:
+v0.4.0 adds explicit reader-config enforcement:
 
-- `async with client.inventory(duration=45) as sweep` always sends stop and waits for the ack when the block is left.
-- `sweep.result` (`SweepResult`) tells a completed sweep from an aborted one: `end_reason`, `completed`, counts, unique EPCs, per-antenna counts and stop-ack status.
-- `ping()`, opt-in keepalive, opt-in auto-reconnect with backoff, `connect(retries=)` and `stop_on_connect`.
-- FakeUR4 scenarios: scripted presence over time, seeded edge-of-field flicker, per-tag antennas, mid-sweep drop, delayed or missing stop ack, idle-connection drop.
-- CLI `ping` / `sweep` / `idle`, and hardware-validation §E (sweep repeatability, idle-session survival, power draw).
+- `client.read_config()` returns the enabled antennas and every antenna's power.
+- `client.ensure_config(antennas, power_dbm, *, save=True)` reads the mask and per-antenna power and writes only what differs: the antenna mask with the save flag, then power for each enabled antenna that differs. It then reads back and verifies. It returns `ConfigResult(changed, before, after, writes, verified, mismatches, dry_run)`. It raises `ValidationError` for an empty set, ports outside 1–4 or power outside 1–30, and nothing is sent in that case. It is never called implicitly, and it refuses to run during a sweep.
+- CLI `config --antennas 1,2 --power 27 [--dry-run|--confirm]`, with the same guard rules as provision: exit 5 without one of the flags, exit 4 on a read-back mismatch. `antennas` now shows the mask, per-antenna power and detection status.
+- FakeUR4 keeps the mask and power as state. Factory default is {1,2,3,4} at 30 dBm. Settings survive `await fake.power_cycle()` only if written with the save flag. `faults.ignore_writes` makes a write succeed without taking effect.
+- hardware-validation §F covers persistence across a power cycle (F.1) and antenna-detection observations (F.2).
 
-No protocol changes. Whether the reader drops idle TCP sessions is recorded as inferred/unknown. An independent hostile review of the change found 4 defects (3 fixed, 1 resolved as a documented rule) and 3 suspected issues (fixed).
+**Antenna detection: not available.** I searched the Java SDK (javap over every class), the Java demo and the C# demo for antenna detect, return loss, VSWR, reflected power and connection state. Nothing addresses the UR4:
+- `sendAntState` (A4/A8 classes) only blinks an antenna LED.
+- `AntennaState` only carries the enable flag.
+- The CONNECTED/DISCONNECTED strings describe the TCP link.
+- `antennaEnabledState` belongs to the JSON protocol of other readers.
+- The UR4 command classes cover only enable, power, work time and interval.
+
+No command was invented. `antennas` reports `detection: unsupported`, and docs/protocol.md §4.5 records the search.
 
 Not done:
 - Nothing is verified on hardware.
-- PyPI publish is still off.
-- Pantry Hub (thermitehash/ha-apps, pantry-hub/) is deliberately not changed from this session.
+- PyPI is still off.
+- Pantry Hub is not changed from this session.
 
 ## Command status
 | Command | CMD/sub | Builder | Reply parser | Status (sdk-derived / inferred) | SDK method |
@@ -43,7 +50,8 @@ Not done:
 | Set trigger params | 0xA1/0B → 0xA2 | yes | yes | sdk-derived bytes; 10 ms units inferred (C# demo) | j.setTriggerWorkModeParaSendData |
 | Get trigger params | 0xA1/0C → 0xA2 | yes | yes | sdk-derived | j.getTriggerWorkModeParaSendData / parseGet… |
 | Get antennas | 0x2A → 0x2B | yes | yes | sdk-derived | j.getAntSendData / parseGetAntData |
-| Set antennas | 0x28 → 0x29 | yes | yes | sdk-derived | j.setAntSendData / parseSetAntData |
+| Set antennas (save) | 0x28 `01 hi lo` → 0x29 | yes | yes | sdk-derived | j.setAntSendData / parseSetAntData |
+| Set antennas, no save (v0.4.0) | 0x28 `00 hi lo` → 0x29 | yes | yes | inferred (the SDK only sends `01`; guarded by `allow_unverified`) | j.setAntSendData (flag byte) |
 | Get power (all) | 0x12 → 0x13 | yes | yes | sdk-derived | i.getPowerSendData / parseGetPowerAllData |
 | Set power (one) | 0x10 → 0x11 | yes | yes | sdk-derived | i.setPowerSendData(int,int) / parseSetPowerData |
 | Set power (several) | 0x10 → 0x11 | yes | yes | sdk-derived | i.setPowerAllSendData / parseSetPowerAllDataData |
@@ -63,92 +71,87 @@ Not done:
 | Device discovery | UDP 1111, passive | n/a | yes | sdk-derived | SocketUdpUR4SearchDevice$ThreadUdpReceive.run |
 | Ping (client-side, v0.3.0) | 0x02 → 0x03 (get version) | reuses get_version | reuses parse_get_version | sdk-derived bytes; use as keepalive is inferred | i.getVersionSendData |
 | Idle TCP session behaviour (v0.3.0) | n/a | n/a | n/a | inferred (unknown until hardware-validation §E.2) | c.setAutoCheckConnectStatus |
+| Read config (v0.4.0, client-side) | 0x2A + 0x12 | reuses get_antennas/get_power | reuses parsers | sdk-derived | j.getAntSendData, i.getPowerSendData |
+| Ensure config (v0.4.0, client-side) | 0x28 (if mask differs), 0x10 per differing antenna, then re-read | reuses builders | reuses parsers | sdk-derived bytes; persistence of power inferred (unknown until §F.1) | j.setAntSendData, i.setPowerSendData |
+| Antenna detection / return loss / VSWR (v0.4.0) | none | no | no | **not in the SDK**; not implemented (see §4.5 of protocol.md) | none found |
 
 ## Spec changes vs. the starting spec
-1. No protocol changes in v0.3.0. Every byte layout is the same as v0.2.0 (see the v0.1.0 list below).
-2. New client behaviour, not protocol:
-   - `ping()` reuses get-version (0x02 → 0x03).
-   - Keepalive pings only after idle time, never during a sweep or a pending stop ack. A ping timeout aborts the link.
-3. `stop_on_connect` matches the SDK, which sends stop inventory on `init()`. It is opt-in here.
-4. **Behaviour changes:**
-   - `stop_drain` now defaults to `timeout` (was 0.5 s), because exiting a sweep waits for the ack.
-   - An abandoned stream stopped by `__del__` now logs a WARNING.
-5. **Sweep end rule** (defined here, not by the SDK; decided by Heather):
-   - `duration_elapsed` (`completed`) means the consumer's `async for` ran until the requested duration ran out, with no connection drop or error. At the deadline, stop is sent and every tag already received is still delivered, so a completed sweep delivers exactly the `reports` it counted.
-   - Any early exit is `stopped` (`completed=False`), however late the block is left afterwards: `break`, leaving the block without iterating, `aclose()`, cancellation. Consumers derive presence from the tags they iterate, so such a sweep can under-report.
-6. Carried over from v0.1.0 (javap vs. starting spec):
-   - Reply CMD = request + 1.
-   - 0xA2 get replies echo the sub-command, set replies carry a status byte.
-   - Max LEN is 2048.
-   - Work mode 2 = trigger.
-   - 0x74 = factory reset.
-   - FastID, TagFocus and 0xE0 are unsupported on the UR4.
-   - Region USA = 0x08.
-   - Discovery runs on UDP 1111.
+1. **Antenna detection (item 2) is not implemented.** The SDK has no such command (see Summary). The spec allowed for this ("if not, document that").
+2. **The antenna "save" flag.** `0x28` data is `flag hi lo`. The SDK always sends `01` (save). `save=False` sends `00`, which is **inferred**, so it needs `allow_unverified=True` (CLI `--no-save --allow-unverified`). The spec's `save=False` default path exists but is guarded.
+3. **Power has no save flag.** Power writes use the SDK layout `0x10 02 ant hi lo`, where the meaning of `02` is unknown, so `save` doesn't apply to power. Whether power persists is hardware-validation §F.1. FakeUR4 treats `02` as "save" (a documented fake assumption).
+4. **Additions beyond the spec:**
+   - `dry_run=True` returns the planned writes (with frame hex) without sending.
+   - `ConfigResult.mismatches` gives human-readable read-back differences.
+   - `ensure_config` raises `UnsafeOperationError` if an inventory is running.
+5. Antennas not in the target set are disabled, and their power is left alone. Power is only compared and written for target antennas (tolerance 0.005 dB).
+6. The reader reports current values, not saved state. A mask left in RAM by `save=False` looks correct to a later `save=True` call and stays unsaved (documented).
+7. Carried over: v0.3.0 sweep rules, and the v0.1.0 javap-derived corrections (reply CMD = request + 1, 0xA2 echo/status, max LEN 2048, trigger = mode 2, 0x74 = factory reset, FastID/TagFocus/0xE0 unsupported, region USA = 0x08, discovery on UDP 1111).
 
 ## Open questions
-1. Does the UR4 drop idle TCP sessions, and after how long? Needs hardware-validation §E.2 (`aiochainway idle --minutes 60`). This decides whether Pantry Hub keeps a connection open with keepalive or connects per sweep.
-2. Does the reader answer commands during an inventory? Keepalive avoids pinging mid-sweep either way. Needs a capture (validation §B).
-3. How repeatable is a 45 s sweep over a static tag set (unique_epcs variance), and is 45 s long enough? Needs §E.1 (`aiochainway sweep --seconds 45 --repeat 10`).
-4. Does the reader keep inventorying after its TCP session drops? `stop_on_connect` covers it, but the behaviour is unknown. Needs an observation.
-5. Power draw idle vs reading, and boot time. Needs §E.3.
-6. Still open from v0.1.0:
-   - Does start inventory (0x82) get a reply?
-   - Is a power cycle needed after an IP change?
-   - What does factory reset reset?
-   - What are the unknown reply bytes (0x4D byte 1, 0x55 byte 1)?
-   - Is region 0x34 New Zealand or Taiwan?
-   - Are trigger units really 10 ms?
-   - How often does the reader announce on UDP 1111?
-   - Are there several frames per UDP datagram?
-   - Do settings persist across a power cycle?
-   - Is there a serial/MAC read command?
-   - DHCP: still waiting on Chainway.
-   - What is the USER window unit in inventory mode?
-7. Pantry Hub lives in thermitehash/ha-apps (pantry-hub/). It will pin v0.3.0 after the tag exists; it isn't changed from this session.
-8. PyPI stays off until hardware validation flips rows to verified (decided). Pin via `git+https://github.com/thermitehash/aiochainway@v0.3.0`.
+1. Do the antenna mask (flag `01`) and power survive a power cycle? Needs §F.1 (`config --confirm`, power-cycle, `antennas`).
+2. Does flag `00` mean "don't save", and does the reader accept it at all? Needs §F.1. Until then `save=False` stays guarded.
+3. What does byte `02` in the power command mean (save / temporary / something else)? Needs §F.1 with a capture.
+4. Does the reader show anything for an unplugged antenna (an error status, zero reads, a LED)? Needs §F.2. The integration should watch `per_antenna_counts` meanwhile.
+5. Does the reader enforce a minimum of one enabled antenna, or limit power per region? The library requires ≥1 and allows 1–30.
+6. Still open from v0.3.0:
+   - Idle TCP drop (§E.2).
+   - Commands during inventory.
+   - Sweep repeatability (§E.1).
+   - Inventory after a dropped session.
+   - Power draw (§E.3).
+7. Still open from v0.1.0:
+   - Start-inventory reply.
+   - Power cycle after an IP change.
+   - Factory-reset scope.
+   - Unknown reply bytes (0x4D, 0x55).
+   - Region 0x34.
+   - Trigger units.
+   - Discovery interval.
+   - Frames per datagram.
+   - Serial/MAC read.
+   - DHCP.
+   - USER window unit.
+8. Pantry Hub (thermitehash/ha-apps, pantry-hub/) pins by git tag; it isn't changed from this session. PyPI stays off until hardware validation flips rows to verified. Pin: `git+https://github.com/thermitehash/aiochainway@v0.4.0`.
 
 ## Hardware impact
-- Door-driven sweeps run in **command mode**: no UDP destination or auto mode needed. HA → reader on TCP 8888 is the only flow.
-- If the reader drops idle TCP (§E.2), use `keepalive_interval_s` at about half the drop time, or connect per sweep with `stop_on_connect=True`.
-- Sweep length and power trade off against repeatability. Use the §E.1 data to choose duration, power (1–30 dBm) and antenna dwell (10–65535 ms).
-- Power budget: measure idle vs reading (§E.3) against the PoE class (802.3af 15.4 W / at 30 W).
-- Door trigger options:
-  - HA's own door sensor triggers a TCP sweep (this release).
-  - Or wire the reed switch to the UR4 GPI and use trigger mode (work mode 2, UDP). That path is not used by Pantry Hub v0.3.0.
-- Unchanged from earlier releases:
-  - static IPv4, no DHCP;
-  - 4 antennas;
-  - region USA = 0x08;
-  - 2 GPIs, 2 GPOs and 1 relay.
+- Config enforcement runs over TCP 8888 only. It doesn't change the network, mode or UDP destination.
+- Writes go to non-volatile settings (flag `01`), so don't call `ensure_config` in a loop. Call it at setup or from an "apply" button. It writes nothing when the settings already match.
+- No antenna detection: an unplugged or broken cable is only visible as an enabled port with zero reads. Label the cables and check each port in §F.2.
+- Power per antenna is 1–30 dBm. More power means more reach and more cross-shelf reads; tune with §E.1.
+- Unchanged: static IPv4, no DHCP; 4 antennas; region USA = 0x08; 2 GPIs, 2 GPOs and 1 relay.
 
 ## Test results
-- Tests: 673/680 (673 passed, 7 skipped by design, 0 failed); 3 consecutive clean full runs. Includes 53 sweep, keepalive and reconnect tests and 5 macOS accept-timing regressions.
-- Coverage: protocol/ 100%, presence 100%, overall 98% (client 94%, testing 98%).
-- Mutation score (protocol/): 92.3% (1566 killed + 4 timeouts of 1701). protocol/ is unchanged since v0.1.0. Survivors: 97 message text, 15 log text, 6 `to_bytes` default byte order, 3 antenna-mask high byte, 2 `pos += 2`, 1 unreachable guard, 1 RSSI rounding, 6 other equivalent changes. All are equivalent or cosmetic; the v0.1.0 report has the details.
+- Tests: 706/713 (706 passed, 7 skipped by design, 0 failed); 3 consecutive clean full runs before the final mutation-gap tests, then a clean full run and a clean CI-profile run. New: 26 tests in test_config.py (plus golden vectors and parser cases for `set_antennas_no_save`).
+- Coverage: protocol/ + presence 100%, overall 98% (client 94%, cli 98%, testing 98%).
+- Mutation score (protocol/): 92.3% (1587 killed + 4 timeouts of 1723). Survivors are 132, all equivalent or cosmetic:
+  - mostly message and log text;
+  - `to_bytes` default byte order;
+  - the antenna-mask high byte;
+  - `pos += 2`;
+  - an unreachable guard;
+  - RSSI rounding.
+  - New in v0.4.0: `save=None` in `build_set_antennas_no_save` (falsy, so equivalent).
+  The 9 "no tests" mutants on the new no-save parser were closed with parser tests.
 - Fuzzing: Hypothesis CI profile, 6 properties × 2000 examples (12,000), 0 failures.
 
 ## Bugs found and fixed
 | # | Found by (test / fuzz / mutation / self-review) | Module | Bug | Fix | Regression test |
 |---|---|---|---|---|---|
-| 1 | test | client.py | `close()` mid-sweep was recorded as `stopped` | `close()` records `connection_lost` | test_sweeps::test_client_close_mid_sweep |
-| 2 | self-review | client.py | keepalive pinged mid-sweep (an empty field means no traffic); a ping timeout aborted a valid sweep | never ping while a sweep runs or a stop ack is pending | test_sweeps::test_keepalive_never_pings_during_a_sweep |
-| 3 | self-review | client.py | after a drop, repeated close markers (one per reconnect attempt) evicted real tags and inflated `dropped` | marker offered once and never evicts a tag; the lost stream is detached | test_sweeps::test_lost_stream_markers_never_evict_tags_or_inflate_dropped |
-| 4 | self-review | client.py | a dead sweep stayed attached after reconnect: it blocked new sweeps, would absorb tags from the new link, and would send stop on the new link | detach on loss; never send stop for a lost sweep | test_sweeps::test_new_sweep_allowed_after_reconnect_and_old_one_not_stopped_there |
-| 5 | self-review | client.py | `connect(retries=)`/`reconnect()` in another task could connect after `close()` | `_open()` no longer clears the closing flag; the loop checks it before each attempt and after success | test_sweeps::test_no_connection_after_close_while_reconnecting |
-| 6 | self-review | client.py | `stop_inventory()` overwrote a pending stop-ack future, so a waiting sweep reported no ack | ack futures kept in a list; 0x8D resolves all | test_sweeps::test_all_pending_stop_acks_resolve |
-| 7 | self-review | client.py | a manual `reconnect()` could race the auto-reconnect loop | manual reconnect cancels the auto task first | test_sweeps::test_manual_reconnect_replaces_auto_reconnect |
-| 8 | self-review | client.py | `close()` / `_close_transport()` swallowed the caller's own CancelledError while waiting for tasks | `_cancel_and_wait()` uses `asyncio.wait` | (covered by every close test; race not reproducible) |
-| 9 | self-review → decision | client.py/models.py | `break` then leaving the block after the deadline reported `completed`, yet the consumer had iterated only part of the tags; tags queued at the deadline were counted but never delivered | only the iterator reaching the deadline completes a sweep; any early exit is `stopped`; at the deadline, stop is sent and queued tags are still delivered | test_sweeps::test_break_before_deadline_then_late_exit_is_stopped, ::test_exit_after_deadline_without_iterating_is_stopped, ::test_cancel_after_deadline_is_stopped, ::test_break_then_leave_before_deadline_is_stopped, ::test_completed_sweep_delivers_every_counted_report |
-| 10 | test (CI, macOS) + watchdog | testing.py (FakeUR4, not library code) | macOS pytest hung until GitHub's 6 h limit. Watchdog dump: the test was stuck in `FakeUR4.stop()` → `server.wait_closed()`, with a late `FakeUR4._handle` reading from a live client. Root cause, shared with #19 and Pantry Hub's macOS FakeUR4 flake: FakeUR4 assumed its accept handler had run by the time the client's `connect()` returned. On macOS (kqueue) it can run later, so `stop()` missed the connection and `wait_closed()` (Python ≥3.12 waits for open connections) never returned | `stop()` refuses handlers that start after it and calls `Server.close_clients()`; new `wait_for_connections(n)` replaces reading `connections` right after a connect; CI: 60 s per-test watchdog printing all asyncio task stacks, faulthandler, verbose output, permanent 20 min job timeout | test_testing::test_stop_with_a_connection_whose_handler_has_not_run, ::test_late_accept_wait_for_connections, ::test_late_accept_drop_connections, ::test_stop_right_after_connect_stress |
+| 1 | test | protocol/commands.py | the new `set_antennas_no_save` registry entry had no golden vector, so the registry-completeness test failed | golden vectors for both `build_set_antennas_no_save` and `save=False` | test_commands golden vectors `A55A000B28000003200D0A` |
+| 2 | self-review | client.py | `ensure_config` during a running sweep would interleave config requests with the tag stream | raises `UnsafeOperationError`; nothing sent | test_config::test_refuses_during_a_sweep |
+| 3 | mutation | protocol/commands.py | `parse_set_antennas_no_save` had no tests in the mutation selection (9 "no tests" mutants) | parser added to the status-parser table and the command-name test | test_commands::test_parse_failure_status[parse_set_antennas_no_save], test_protocol_edges::test_ack_parsers_carry_command_name |
+| 4 | self-review | client.py / docs | `save=True` after an earlier `save=False` saw a matching mask and wrote nothing, leaving it unsaved; undocumented | documented in the docstring and integration notes (the protocol can't report saved state) | n/a (documented limitation) |
 
 ## Risks for hardware bring-up
-1. The reader may not answer commands during an inventory. Keepalive and sweeps don't depend on it, but stop must still be honoured. Covered: stop is written synchronously and a missing ack is recorded (`stop_acknowledged=false`), not raised.
-2. The reader may silently drop idle TCP sessions. Covered: keepalive (opt-in) aborts on a ping timeout, and auto-reconnect plus `stop_on_connect` recover. §E.2 measures the timeout.
-3. 45 s may be too short or the power too low for a full cabinet read. Covered: §E.1 measures variance and which EPCs flicker. Pantry Hub should act only on `completed` sweeps.
-4. The reader may keep inventorying after an HA crash. Covered: `stop_on_connect=True`.
-5. Earlier risks still apply:
-   - auto mode vs TCP;
+1. The save flag may not work as inferred. Covered: `save=True` uses the SDK's byte; `00` is guarded; §F.1 checks persistence.
+2. Power may not persist across a power cycle. Covered: `ensure_config` at every HA setup is cheap (read-only when the settings match) and re-applies.
+3. The reader may round or clamp power (e.g. per region). Covered: read-back mismatch → `verified=False` with `mismatches`, CLI exit 4.
+4. A write may be acknowledged but not applied. Covered: always re-read after writes (FakeUR4 `ignore_writes` tests that path).
+5. An unplugged antenna is invisible. Covered: documented; watch `per_antenna_counts`.
+6. Earlier risks still apply:
+   - commands during inventory;
+   - idle TCP drop;
+   - sweep length;
    - IP change last;
    - strict tag parsing;
    - macOS firewall;
@@ -157,10 +160,10 @@ Not done:
 ## First steps when the reader arrives
 1. `sudo ifconfig en<N> alias 192.168.99.100 255.255.255.0` and `ping -c 3 192.168.99.202`
 2. `aiochainway --debug --host 192.168.99.202 version` and `aiochainway --host 192.168.99.202 ping --count 5`
-3. `aiochainway --host 192.168.99.202 --json info` (save the original settings)
-4. Wireshark (`ip.addr == 192.168.99.202`), then hardware-validation §A and §B.
-5. `aiochainway --host 192.168.99.202 inventory --seconds 45 --stop-first` (check the summary line says `duration_elapsed … stop acked`)
-6. §E.1: `aiochainway --host 192.168.99.202 --json sweep --seconds 45 --repeat 10 --pause 15 > captures/sweeps-45s.jsonl`
-7. §E.3: read PoE watts idle, during a sweep, at 30 dBm, and at boot.
-8. §E.2: `aiochainway --host 192.168.99.202 --json idle --minutes 60`
-9. Then §C writes and §D network changes last. Attach the pcaps and JSONL to a follow-up PR.
+3. `aiochainway --host 192.168.99.202 --json info > captures/original.json` (save the original settings)
+4. `aiochainway --host 192.168.99.202 antennas` (factory default expected: 1,2,3,4 at 30 dBm)
+5. Wireshark (`ip.addr == 192.168.99.202`), then hardware-validation §A and §B.
+6. `aiochainway --debug --host 192.168.99.202 config --antennas 1,2 --power 27 --dry-run`, then `--confirm`; check exit 0 and `verified`.
+7. §F.1: power-cycle the reader, then `aiochainway --host 192.168.99.202 antennas` (persisted?).
+8. §F.2: unplug one antenna, run `inventory --seconds 10`, and note statuses, per-antenna counts and LEDs.
+9. §E.1–E.3 sweeps, idle and power, then §C writes and §D network changes last. Attach pcaps and JSONL to a follow-up PR.

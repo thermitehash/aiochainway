@@ -113,8 +113,9 @@ All payloads are hex. `ip4` = 4 address bytes, `port2` = big-endian u16.
 | Command | Request | Reply | Source | Status |
 |---|---|---|---|---|
 | Set antennas | `28` / `01 hi lo`: `01` = the save flag the SDK always sends; `lo` bit n-1 = ANT n (1–8), `hi` = ANT 9–16 | `29` / `01` | `j.setAntSendData`, `UR4.setAntenna` | sdk-derived |
+| Set antennas, no save | `28` / `00 hi lo`. `j.setAntSendData` takes the flag as a parameter, but the UR4 class only ever passes `01`; that `00` means "don't save" is a guess | `29` / `01` | `j.setAntSendData(char,byte[])` | **inferred** (`aiochainway`: `ensure_config(save=False, allow_unverified=True)`) |
 | Get antennas | `2A` / — | `2B` / `hi lo` (no status) | `j.getAntSendData`, `j.parseGetAntData`, `UR4.getAntenna` | sdk-derived |
-| Set power (one antenna) | `10` / `02 ant rH rL wH wL`: read and write power in dBm×100, both set to the same value; the SDK clamps to 1–30 dBm | `11` / `01` | `i.setPowerSendData(int,int)`, `i.parseSetPowerData` | sdk-derived |
+| Set power (one antenna) | `10` / `02 ant rH rL wH wL`: read and write power in dBm×100, both set to the same value; the SDK clamps to 1–30 dBm. The meaning of the constant `02` is unknown (it may be a save flag), so whether power survives a power cycle is untested (hardware-validation §F) | `11` / `01` | `i.setPowerSendData(int,int)`, `i.parseSetPowerData` | sdk-derived |
 | Set power (several) | `10` / `02 (ant rH rL wH wL)*` | `11` / `01` | `i.setPowerAllSendData`, `i.parseSetPowerAllDataData` | sdk-derived |
 | Get power | `12` / — | `13` / `00 (ant rH rL wH wL)*`; antenna `00` means 1; power `0` means "same as ANT1"; the SDK fills missing antennas 1–8 with ANT1's value | `i.getPowerSendData`, `i.parseGetPowerAllData` | sdk-derived |
 | Set region | `2C` / `01 code` (`01` = save flag) | `2D` / `01` | `i.setFrequencyModeSendData`, `i.parseSetFrequencyModeData` | sdk-derived |
@@ -158,6 +159,32 @@ Region codes (javadoc of `setFrequencyMode` and the demo's list):
 
 RF link values (javadoc): `0` DSB_ASK/FM0/40 kHz, `1` PR_ASK/Miller4/250 kHz,
 `2` PR_ASK/Miller4/300 kHz, `3` DSB_ASK/FM0/400 kHz.
+
+### 4.5 Antenna detection: not available
+
+There is **no antenna-detect, return-loss, VSWR or antenna-connection-state
+command** for the UR4 in Chainway's Java SDK (`ReaderAPI20240822.jar`). How
+this was checked (aiochainway v0.4.0):
+
+* `javap -p` on every class in the jar (6,067 signature lines), searched for
+  `vswr`, `return loss`, `reflect`, `detect`, `antenna state/status/connect`,
+  `impedance`, `standing`. The only hits are:
+  * `AntennaState`, which holds an antenna name and an `enable` flag (the
+    enable mask of §4.4);
+  * a private `sendAntState(String)` in the A4/A8 reader classes
+    (`RFIDWithUHFNetworkAx`, `RFIDWithUHFSerialPortAxBase`), which only blinks
+    an antenna LED (`setAntBlink`).
+* `javap -c -constants` string constants across the jar: `CONNECTED` /
+  `DISCONNECTED` are the TCP link state, and `antennaEnabledState` belongs to
+  the JSON protocol of other reader families.
+* The UR4 command classes (`RFIDWithUHFNetworkUR4`, `j`, `i`) expose antenna
+  enable, power, work (dwell) time and interval time only.
+* The Windows C# demo (`UR4Demo`) declares no such native function either.
+
+So `aiochainway` has no `get_antenna_status()`, and `ensure_config` can't
+refuse an empty port. Whether an empty port is visible any other way is a
+hardware-validation item (§F.2). If Chainway's official protocol document
+lists a command, it can be added as `sdk-derived` or `verified` then.
 
 ## 5. Tag record (payload of `0x83`)
 

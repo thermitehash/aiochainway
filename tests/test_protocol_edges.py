@@ -226,6 +226,11 @@ def test_ack_parsers_carry_command_name() -> None:
         UnexpectedReplyError, match=r"^set_antennas: expected reply CMD 0x29"
     ):
         c.parse_set_antennas(Frame(0xA2, b"\x01"))
+    with pytest.raises(
+        UnexpectedReplyError, match=r"^set_antennas_no_save: expected reply CMD 0x29"
+    ):
+        c.parse_set_antennas_no_save(Frame(0xA2, b"\x01"))
+    c.parse_set_antennas_no_save(Frame(0x29, b"\x01"))
 
 
 def test_error_messages() -> None:

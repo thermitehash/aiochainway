@@ -43,6 +43,7 @@ __all__ = [
     "FakeUR4",
     "Faults",
     "ReaderState",
+    "SavedSettings",
     "ScriptedTag",
     "tag_frames",
     "tag_record",
@@ -181,6 +182,9 @@ class Faults:
     disconnect_after_s: float | None = None
     #: Seconds to wait before acknowledging stop (0x8D).
     stop_ack_delay: float = 0.0
+    #: Command names ("set_antennas", "set_power") acknowledged with OK but not
+    #: applied, so a read-back differs from what was written.
+    ignore_writes: set[str] = field(default_factory=set)
     #: Close a connection that received nothing for this many seconds while no
     #: inventory is running (some readers drop idle TCP sessions; unknown for
     #: the UR4, see docs/hardware-validation.md).
@@ -222,6 +226,19 @@ NAMES: dict[tuple[int, int | None], str] = {
 }
 
 
+#: Factory defaults the fake starts with and returns to on factory reset.
+FACTORY_ANTENNA_MASK = 0x0F  # antennas 1-4
+FACTORY_POWER: dict[int, int] = {1: 30, 2: 30, 3: 30, 4: 30}
+
+
+@dataclass
+class SavedSettings:
+    """Settings that survive :meth:`FakeUR4.power_cycle` (written with save)."""
+
+    antenna_mask: int = FACTORY_ANTENNA_MASK
+    power: dict[int, int] = field(default_factory=lambda: dict(FACTORY_POWER))
+
+
 @dataclass
 class ReaderState:
     """Settings the fake remembers."""
@@ -235,8 +252,8 @@ class ReaderState:
     gateway: str = "192.168.99.1"
     dest_ip: str = "192.168.99.100"
     dest_port: int = 8888
-    antenna_mask: int = 0x0F
-    power: dict[int, int] = field(default_factory=lambda: {1: 30, 2: 30, 3: 30, 4: 30})
+    antenna_mask: int = FACTORY_ANTENNA_MASK
+    power: dict[int, int] = field(default_factory=lambda: dict(FACTORY_POWER))
     region: int = 0x08
     gpi: tuple[int, int] = (0, 1)
     beep: int = 1
@@ -268,6 +285,9 @@ class FakeUR4:
     ) -> None:
         """Create a stopped fake; call :meth:`start` or use ``async with``."""
         self.state = ReaderState()
+        #: What survives :meth:`power_cycle`: only settings written with the
+        #: save flag (antenna mask with flag 0x01; power with the SDK's 0x02).
+        self.saved = SavedSettings()
         self.faults = Faults()
         self.tags: list[bytes] = [tag_record("E28011700000020A1B2C3D4E")]
         self.tag_interval = 0.005
@@ -349,6 +369,25 @@ class FakeUR4:
         for writer in list(self._writers):
             writer.close()
         await asyncio.sleep(0.01)
+
+    async def power_cycle(self) -> None:
+        """Simulate a reader power cycle.
+
+        Every connection drops, and the antenna mask and power revert to what
+        was last written with the save flag (factory defaults if never saved).
+        Other settings are not modelled and keep their values.
+        """
+        for writer in list(self._writers):
+            writer.close()
+        self.state.antenna_mask = self.saved.antenna_mask
+        self.state.power = dict(self.saved.power)
+        await asyncio.sleep(0.01)
+
+    def apply_factory_defaults(self) -> None:
+        """Reset antenna mask and power to factory defaults (live and saved)."""
+        self.state.antenna_mask = FACTORY_ANTENNA_MASK
+        self.state.power = dict(FACTORY_POWER)
+        self.saved = SavedSettings()
 
     def reset_clock(self) -> None:
         """Restart the scenario clock at zero."""
@@ -584,13 +623,22 @@ class _Conn:
             case (0xA1, 0x0C):
                 await self.reply(name, 0xA2, b"\x0c" + s.trigger)
             case (0x28, None):
-                s.antenna_mask = (d[1] << 8) | d[2]
+                if "set_antennas" not in self.fake.faults.ignore_writes:
+                    s.antenna_mask = (d[1] << 8) | d[2]
+                    if d[0] == 0x01:  # save flag (the only value the SDK sends)
+                        self.fake.saved.antenna_mask = s.antenna_mask
                 await self.reply(name, 0x29, ok)
             case (0x2A, None):
                 await self.reply(name, 0x2B, s.antenna_mask.to_bytes(2, "big"))
             case (0x10, None):
-                for i in range(1, len(d) - 4, 5):
-                    s.power[d[i]] = int.from_bytes(d[i + 1 : i + 3], "big") // 100
+                if "set_power" not in self.fake.faults.ignore_writes:
+                    for i in range(1, len(d) - 4, 5):
+                        dbm = int.from_bytes(d[i + 1 : i + 3], "big") // 100
+                        s.power[d[i]] = dbm
+                        # Fake assumption: the SDK's constant first byte 0x02
+                        # saves (unverified; hardware-validation §F).
+                        if d[0] == 0x02:
+                            self.fake.saved.power[d[i]] = dbm
                 await self.reply(name, 0x11, ok)
             case (0x12, None):
                 payload = self.status(name, ok=0x00)
@@ -627,6 +675,7 @@ class _Conn:
                     ok + bytes((d[0],)) + s.work_time[d[0]].to_bytes(2, "big"),
                 )
             case (0x74, None):
+                self.fake.apply_factory_defaults()
                 await self.reply(name, 0x75, ok)
             case _:
                 await self.reply("?", reply_cmd, b"\x00")

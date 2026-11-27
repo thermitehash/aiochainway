@@ -205,6 +205,7 @@ COMMANDS: dict[str, CommandInfo] = {
         CommandInfo("get_trigger_config", 0xA1, 0x0C, 0xA2, _SD, "j.getTriggerWorkModeParaSendData / j.parseGetTriggerWorkModeParaReceiveData", "Trigger-mode parameters"),
         CommandInfo("get_antennas", 0x2A, None, 0x2B, _SD, "j.getAntSendData / j.parseGetAntData", "Enabled antennas"),
         CommandInfo("set_antennas", 0x28, None, 0x29, _SD, "j.setAntSendData / j.parseSetAntData", "Enable antennas"),
+        CommandInfo("set_antennas_no_save", 0x28, None, 0x29, _INF, "j.setAntSendData with flag 00 (the SDK only ever sends 01)", "Enable antennas without saving"),
         CommandInfo("get_power", 0x12, None, 0x13, _SD, "i.getPowerSendData / i.parseGetPowerAllData", "Per-antenna power"),
         CommandInfo("set_power", 0x10, None, 0x11, _SD, "i.setPowerSendData(int,int) / i.parseSetPowerData", "Set one antenna's power"),
         CommandInfo("set_power_all", 0x10, None, 0x11, _SD, "i.setPowerAllSendData / i.parseSetPowerAllDataData", "Set several antennas' power"),
@@ -569,18 +570,42 @@ def parse_get_antennas(frame: Frame) -> AntennaState:
     )
 
 
-def build_set_antennas(state: AntennaState) -> Request:
-    """Build *set antennas* (``0x28 01 hi lo``); ``01`` is the save flag the SDK sends."""
+#: Save flags for *set antennas*. The SDK always sends ``0x01``; ``0x00``
+#: ("don't save") is inferred and has not been seen in the SDK.
+ANT_SAVE = 0x01
+ANT_NO_SAVE = 0x00
+
+
+def build_set_antennas(state: AntennaState, *, save: bool = True) -> Request:
+    """Build *set antennas* (``0x28 flag hi lo``).
+
+    ``flag`` is ``01`` (save; what the SDK always sends) or, with
+    ``save=False``, ``00`` (inferred: never seen in the SDK).
+    """
     if not state.enabled:
         raise ValidationError("at least one antenna must stay enabled")
+    flag = ANT_SAVE if save else ANT_NO_SAVE
     return Request(
-        "set_antennas", CMD_SET_ANTENNAS, b"\x01" + _antenna_mask(state.enabled), 0x29
+        "set_antennas" if save else "set_antennas_no_save",
+        CMD_SET_ANTENNAS,
+        bytes((flag,)) + _antenna_mask(state.enabled),
+        0x29,
     )
 
 
 def parse_set_antennas(frame: Frame) -> None:
     """Check the ``set_antennas`` acknowledgement (status 0x01)."""
     _ack("set_antennas", frame, 0x29)
+
+
+def build_set_antennas_no_save(state: AntennaState) -> Request:
+    """Build *set antennas* with the inferred "don't save" flag (``0x28 00 hi lo``)."""
+    return build_set_antennas(state, save=False)
+
+
+def parse_set_antennas_no_save(frame: Frame) -> None:
+    """Check the ``set_antennas_no_save`` acknowledgement (status 0x01)."""
+    _ack("set_antennas_no_save", frame, 0x29)
 
 
 def _check_power(value: int) -> int:

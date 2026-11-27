@@ -17,6 +17,7 @@ and UDP auto-mode inventory, no dependencies.
   datagram, source filtering, a callback that can't crash the listener
 * `TagPresence`: pure presence tracking (first/last seen, RSSI, antennas, TTL)
 * `provision()`: guarded, ordered setup for auto mode (IP change last)
+* `ensure_config()`: make the antenna mask and power match, writing only what differs, then verify
 * `aiochainway` CLI that runs on macOS and Linux
 * `aiochainway.testing.FakeUR4`: a fake reader for your own tests
 
@@ -98,7 +99,8 @@ Global options: `--host` (or `AIOCHAINWAY_HOST`), `--port`, `--timeout`,
 | `ping [--count N]` | round-trip latency |
 | `idle [--minutes 60]` | does the reader drop an idle TCP session? |
 | `listen [--port P] [--source IP] [--seconds N]` | receive auto-mode tags over UDP |
-| `antennas [--set 1,2]` | enabled antennas |
+| `antennas [--set 1,2]` | enabled antennas, per-antenna power, detection support (none on the UR4) |
+| `config --antennas 1,2 --power 27 [--dry-run\|--confirm]` | write only the antenna/power settings that differ, then verify |
 | `power [--set DBM] [--antenna N]` | antenna power, 1–30 dBm |
 | `region [--set usa]` | frequency region |
 | `gpi` / `gpo --relay 1` | GPIO |

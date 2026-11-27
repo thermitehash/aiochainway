@@ -21,7 +21,7 @@ import time
 from typing import Any, TextIO
 
 from . import __version__
-from .client import UR4Client, check_guard
+from .client import UR4Client, _check_config_target, check_guard
 from .listener import UR4UdpListener, discover
 from .models import (
     AntennaPower,
@@ -58,6 +58,11 @@ EXIT_PROTOCOL = 4
 EXIT_UNSAFE = 5
 
 DEFAULT_HOST = os.environ.get("AIOCHAINWAY_HOST", "192.168.99.202")
+
+DETECTION_NOTE = (
+    "not supported (the UR4 protocol has no antenna-detect/VSWR command; "
+    "see docs/protocol.md)"
+)
 
 FIREWALL_NOTE = (
     "macOS: the first time, the system may ask whether Python may accept incoming "
@@ -256,8 +261,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="stop after this long (default: until Ctrl-C)",
     )
 
-    p = sub.add_parser("antennas", help="show or set enabled antennas")
+    p = sub.add_parser(
+        "antennas", help="show enabled antennas, their power and detection support"
+    )
     p.add_argument("--set", type=_antenna_list, metavar="LIST", help="e.g. 1,2")
+
+    p = sub.add_parser(
+        "config",
+        help="make the antenna mask and power match (writes only what differs)",
+    )
+    p.add_argument("--antennas", type=_antenna_list, required=True, metavar="LIST")
+    p.add_argument("--power", type=int, required=True, metavar="DBM", help="1-30")
+    p.add_argument(
+        "--dry-run", action="store_true", help="read and show the plan; write nothing"
+    )
+    p.add_argument("--confirm", action="store_true", help="really write")
+    p.add_argument(
+        "--no-save",
+        action="store_true",
+        help="don't set the antenna save flag (inferred; needs --allow-unverified)",
+    )
+    p.add_argument("--allow-unverified", action="store_true")
 
     p = sub.add_parser("power", help="show or set antenna power (dBm)")
     p.add_argument("--set", type=int, metavar="DBM", help="1-30")
@@ -505,6 +529,17 @@ async def _cmd_reader(args: argparse.Namespace, out: Output) -> int:
         raise UsageError("network --set needs --ip and --gateway")
     if cmd == "destination" and args.set and not args.ip:
         raise UsageError("destination --set needs --ip")
+    if cmd == "config":
+        _check_config_target(args.antennas, args.power)  # exit 2 before connecting
+        if not args.dry_run and not args.confirm:
+            raise UnsafeOperationError(
+                "config writes reader settings; pass --dry-run to see the plan "
+                "or --confirm to write"
+            )
+        if args.no_save and not args.allow_unverified and not args.dry_run:
+            raise UnsafeOperationError(
+                "--no-save sends an inferred flag; add --allow-unverified"
+            )
     if cmd == "factory-reset" or (cmd in guarded and args.set):
         check_guard(
             guarded.get(cmd, "factory_reset"),
@@ -564,11 +599,47 @@ async def _cmd_reader(args: argparse.Namespace, out: Output) -> int:
             case "antennas":
                 if args.set is not None:
                     await reader.set_antennas(args.set)
-                state = await reader.get_antennas()
-                out.emit(
-                    ",".join(map(str, sorted(state.enabled))) or "none",
-                    {"antennas": state.enabled},
+                cfg = await reader.read_config()
+                enabled = ",".join(map(str, sorted(cfg.antennas))) or "none"
+                power_text = ", ".join(
+                    f"ant{a}={p:g} dBm" for a, p in sorted(cfg.power.items())
                 )
+                out.emit(
+                    f"antennas:  {enabled}\npower:     {power_text}\n"
+                    f"detection: {DETECTION_NOTE}",
+                    {
+                        "antennas": sorted(cfg.antennas),
+                        "power": cfg.power,
+                        "detection": "unsupported",
+                    },
+                )
+            case "config":
+                cfg_result = await reader.ensure_config(
+                    args.antennas,
+                    args.power,
+                    save=not args.no_save,
+                    allow_unverified=args.allow_unverified,
+                    dry_run=args.dry_run,
+                )
+                verb = "would write" if cfg_result.dry_run else "wrote"
+                for w in cfg_result.writes:
+                    out.emit(
+                        f"{verb}: {w.description}\n       {w.frame_hex}",
+                        {"write": w.command, "description": w.description,
+                         "frame": w.frame_hex, "dry_run": cfg_result.dry_run},
+                    )  # fmt: skip
+                if not cfg_result.writes:
+                    out.emit("already configured; nothing to write", {"changed": False})
+                if cfg_result.dry_run:
+                    out.emit("dry run: nothing was written", {"dry_run": True})
+                    return EXIT_OK
+                out.emit(
+                    "verified" if cfg_result.verified else "NOT verified: " + "; ".join(cfg_result.mismatches),
+                    {"changed": cfg_result.changed, "verified": cfg_result.verified,
+                     "mismatches": list(cfg_result.mismatches)},
+                )  # fmt: skip
+                if not cfg_result.verified:
+                    return EXIT_PROTOCOL
             case "power":
                 if args.set is not None:
                     ants = args.antenna or [1, 2, 3, 4]

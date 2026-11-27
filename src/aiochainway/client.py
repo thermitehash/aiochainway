@@ -16,12 +16,15 @@ import weakref
 from .models import (
     AntennaPower,
     AntennaState,
+    ConfigResult,
+    ConfigWrite,
     FrequencyRegion,
     Gen2Settings,
     GpiState,
     GpoState,
     InventoryModeConfig,
     NetworkChangeResult,
+    ReaderConfig,
     ReaderInfo,
     ReaderNetworkConfig,
     RfLink,
@@ -32,6 +35,7 @@ from .models import (
     TriggerConfig,
     UdpDestination,
     WorkMode,
+    check_antenna,
 )
 from .protocol import commands as c
 from .protocol.errors import (
@@ -1123,6 +1127,111 @@ class UR4Client:
             "read_tag_buffer (0xE0) is not used by the UR4; use inventory()"
         )
 
+    # Configuration enforcement -------------------------------------------------
+
+    async def read_config(self) -> ReaderConfig:
+        """Read the enabled antennas and every antenna's power."""
+        state = await self.get_antennas()
+        powers = await self.get_power_all()
+        return ReaderConfig(
+            antennas=state.enabled, power={p.antenna: p.power for p in powers}
+        )
+
+    async def ensure_config(
+        self,
+        antennas: Iterable[int],
+        power_dbm: int,
+        *,
+        save: bool = True,
+        allow_unverified: bool = False,
+        dry_run: bool = False,
+    ) -> ConfigResult:
+        """Make the reader's antenna mask and power match, writing only what differs.
+
+        Reads the mask and per-antenna power, then writes the antenna mask
+        (with the save flag) if it differs, and the power of each requested
+        antenna whose power differs. Then reads everything back and verifies.
+        Antennas not in ``antennas`` are disabled; their power is left alone.
+        Never called implicitly.
+
+        ``save=False`` sends the antenna "don't save" flag ``0x00``, which is
+        inferred (the SDK only ever sends ``0x01``), so it needs
+        ``allow_unverified=True``. Power writes always use the SDK's layout;
+        whether power survives a power cycle is a hardware-validation item.
+        ``dry_run=True`` reads the current config and returns the planned
+        writes without sending any.
+
+        The reader can't report whether a setting is saved, only its current
+        value. If an earlier ``save=False`` call left the right mask in RAM,
+        ``save=True`` sees nothing to write and the mask is still unsaved;
+        power-cycle the reader (or write once more) to be sure.
+
+        Returns a :class:`ConfigResult`; a failed read-back is reported in
+        ``verified``/``mismatches``, not raised.
+
+        Raises:
+            ValidationError: empty ``antennas``, a port outside 1-4, or power
+                outside 1-30 dBm (nothing is sent).
+            UnsafeOperationError: ``save=False`` without ``allow_unverified``,
+                or an inventory is running.
+            ReaderError: the reader rejected a write (earlier writes stay).
+
+        """
+        target = _check_config_target(antennas, power_dbm)
+        if self._inventory is not None:
+            raise UnsafeOperationError(
+                "ensure_config can't run during an inventory; finish the sweep first"
+            )
+        if not save and not allow_unverified:
+            raise UnsafeOperationError(
+                "save=False sends the antenna flag 0x00, which is inferred (the "
+                "SDK only sends 0x01); pass allow_unverified=True to send it"
+            )
+        before = await self.read_config()
+        planned: list[tuple[c.Request, str]] = []
+        if before.antennas != target:
+            ants = ",".join(str(a) for a in sorted(target))
+            planned.append(
+                (
+                    c.build_set_antennas(AntennaState(target), save=save),
+                    f"Enable antennas {ants}" + (" (save)" if save else " (no save)"),
+                )
+            )
+        for ant in sorted(target):
+            if not _power_matches(before.power.get(ant), power_dbm):
+                planned.append(
+                    (
+                        c.build_set_power(ant, power_dbm),
+                        f"Set antenna {ant} power to {power_dbm} dBm",
+                    )
+                )
+        writes = tuple(
+            ConfigWrite(req.name, desc, hexdump(req.encode())) for req, desc in planned
+        )
+        if dry_run:
+            return ConfigResult(
+                changed=bool(writes), before=before, after=None, writes=writes,
+                dry_run=True,
+            )  # fmt: skip
+        for req, _ in planned:
+            frame = await self._request(req)
+            if req.cmd == c.CMD_SET_POWER:
+                c.parse_set_power(frame)
+            elif save:
+                c.parse_set_antennas(frame)
+            else:
+                c.parse_set_antennas_no_save(frame)
+        after = await self.read_config() if planned else before
+        mismatches = _config_mismatches(after, target, power_dbm)
+        return ConfigResult(
+            changed=bool(writes),
+            before=before,
+            after=after,
+            writes=writes,
+            verified=not mismatches,
+            mismatches=mismatches,
+        )
+
     # Guarded commands --------------------------------------------------------
 
     async def set_network_config(
@@ -1169,6 +1278,46 @@ class UR4Client:
         """
         check_guard("factory_reset", confirm=confirm, allow_unverified=allow_unverified)
         c.parse_factory_reset(await self._request(c.build_factory_reset()))
+
+
+def _check_config_target(antennas: Iterable[int], power_dbm: int) -> frozenset[int]:
+    """Validate ``ensure_config`` arguments; return the antenna set."""
+    try:
+        target = frozenset(antennas)
+    except TypeError as err:
+        raise ValidationError("antennas must be an iterable of 1-4") from err
+    if not target:
+        raise ValidationError("at least one antenna must be enabled")
+    for ant in target:
+        check_antenna(ant)
+    if (
+        isinstance(power_dbm, bool)
+        or not isinstance(power_dbm, int)
+        or not 1 <= power_dbm <= 30
+    ):
+        raise ValidationError(f"power must be an integer 1-30 dBm, got {power_dbm!r}")
+    return target
+
+
+def _power_matches(current: float | None, wanted: int) -> bool:
+    return current is not None and abs(current - wanted) < 0.005
+
+
+def _config_mismatches(
+    after: ReaderConfig, target: frozenset[int], power_dbm: int
+) -> tuple[str, ...]:
+    out: list[str] = []
+    if after.antennas != target:
+        out.append(
+            f"antennas read back as {sorted(after.antennas)}, expected {sorted(target)}"
+        )
+    for ant in sorted(target):
+        current = after.power.get(ant)
+        if not _power_matches(current, power_dbm):
+            out.append(
+                f"antenna {ant} power read back as {current}, expected {power_dbm}"
+            )
+    return tuple(out)
 
 
 async def wait_for_reader(
