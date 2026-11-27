@@ -150,3 +150,24 @@ def test_tag_record_layouts_parse() -> None:
 def test_tag_record_validation(kwargs: dict[str, Any]) -> None:
     with pytest.raises(ValidationError):
         tag_record(**kwargs)
+
+
+async def test_stop_with_a_connection_whose_handler_has_not_run() -> None:
+    # On macOS connect() can return before the fake's accept handler runs.
+    # stop() used to miss that connection and wait_closed() hung forever.
+    fake = FakeUR4()
+    original = fake._handle
+
+    async def late(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await asyncio.sleep(0.2)
+        await original(reader, writer)
+
+    fake._handle = late  # type: ignore[method-assign]  # simulate a late accept
+    await fake.start()
+    client = UR4Client(fake.host, fake.port, timeout=0.5)
+    await client.connect()
+    async with asyncio.timeout(3):
+        await fake.stop()
+    await asyncio.sleep(0.3)  # the late handler must refuse, not register
+    assert fake.connections == 0
+    await client.close()

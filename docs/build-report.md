@@ -124,7 +124,7 @@ Not done:
   - 2 GPIs, 2 GPOs and 1 relay.
 
 ## Test results
-- Tests: 666/673 (666 passed, 7 skipped by design, 0 failed); 3 consecutive clean full runs. Includes 51 sweep, keepalive and reconnect tests.
+- Tests: 667/674 (667 passed, 7 skipped by design, 0 failed); 3 consecutive clean full runs. Includes 51 sweep, keepalive and reconnect tests.
 - Coverage: protocol/ 100%, presence 100%, overall 97% (client 94%, testing 98%).
 - Mutation score (protocol/): 92.3% (1566 killed + 4 timeouts of 1701). protocol/ is unchanged since v0.1.0. Survivors: 97 message text, 15 log text, 6 `to_bytes` default byte order, 3 antenna-mask high byte, 2 `pos += 2`, 1 unreachable guard, 1 RSSI rounding, 6 other equivalent changes. All are equivalent or cosmetic; the v0.1.0 report has the details.
 - Fuzzing: Hypothesis CI profile, 6 properties × 2000 examples (12,000), 0 failures.
@@ -141,6 +141,7 @@ Not done:
 | 7 | self-review | client.py | a manual `reconnect()` could race the auto-reconnect loop | manual reconnect cancels the auto task first | test_sweeps::test_manual_reconnect_replaces_auto_reconnect |
 | 8 | self-review | client.py | `close()` / `_close_transport()` swallowed the caller's own CancelledError while waiting for tasks | `_cancel_and_wait()` uses `asyncio.wait` | (covered by every close test; race not reproducible) |
 | 9 | self-review (rule) | client.py/models.py | `break` then leaving the block after the deadline reported `completed`; ambiguous | documented timing rule on SweepEndReason; cancellation follows the same rule | test_sweeps::test_break_then_leave_after_deadline_is_completed_by_rule, ::test_break_then_leave_before_deadline_is_stopped, ::test_cancel_after_deadline_is_completed_by_rule |
+| 10 | test (CI, macOS) | testing.py | `FakeUR4.stop()` hung forever on macOS: a connection accepted by the kernel whose handler hadn't run yet was missed, and `server.wait_closed()` waited for it (the macOS job hit GitHub's 6 h limit) | `stop()` refuses late handlers and calls `Server.close_clients()`; CI got a 60 s per-test watchdog that prints task stacks, plus job timeouts | test_testing::test_stop_with_a_connection_whose_handler_has_not_run |
 
 ## Risks for hardware bring-up
 1. The reader may not answer commands during an inventory. Keepalive and sweeps don't depend on it, but stop must still be honoured. Covered: stop is written synchronously and a missing ack is recorded (`stop_acknowledged=false`), not raised.

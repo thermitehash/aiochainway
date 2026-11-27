@@ -287,11 +287,13 @@ class FakeUR4:
         self.port = 0
         # Replaced (after being set) on every new connection or frame.
         self._activity = asyncio.Event()
+        self._stopping = False
 
     # Lifecycle -----------------------------------------------------------------
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> None:
         """Listen on ``host:port`` (port 0 picks a free one; see ``self.port``)."""
+        self._stopping = False
         self._server = await asyncio.start_server(self._handle, host, port)
         self.reset_clock()
         self.host = host
@@ -312,16 +314,24 @@ class FakeUR4:
         await self.stop()
 
     async def stop(self) -> None:
-        """Close every connection and stop listening. Safe to call twice."""
-        if self._server is not None:
-            self._server.close()
+        """Close every connection and stop listening. Safe to call twice.
+
+        A connection the kernel accepted whose handler has not run yet (seen
+        on macOS) is closed too: ``wait_closed()`` would otherwise wait for it
+        forever.
+        """
+        self._stopping = True
+        server = self._server
+        if server is not None:
+            server.close()
+            server.close_clients()  # also transports whose handler hasn't run
         for writer in list(self._writers):
             writer.close()
         for task in list(self._tasks):
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
-        if self._server is not None:
-            await self._server.wait_closed()
+        if server is not None:
+            await server.wait_closed()
             self._server = None
 
     async def drop_connections(self, timeout: float = 3.0) -> None:
@@ -368,6 +378,11 @@ class FakeUR4:
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        if self._stopping:  # accepted just before stop(); refuse it
+            writer.close()
+            with contextlib.suppress(OSError, ConnectionError):
+                await writer.wait_closed()
+            return
         self.connections += 1
         self._writers.add(writer)
         self._notify()
