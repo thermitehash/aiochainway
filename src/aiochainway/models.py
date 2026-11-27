@@ -372,20 +372,21 @@ class NetworkChangeResult:
 class SweepEndReason(StrEnum):
     """Why an inventory sweep ended (:attr:`SweepResult.end_reason`).
 
-    The rule is about the reader, not the consumer: a sweep is
-    ``DURATION_ELAPSED`` when *stop* was sent after the requested duration had
-    run out and nothing went wrong, whether or not the consumer read every
-    tag (all reports are counted in :class:`SweepResult` either way). Inside
-    ``async with``, ``break`` ends the loop, not the sweep; the sweep ends when
-    the block is left.
+    A sweep is ``DURATION_ELAPSED`` (``completed``) only when the consumer's
+    ``async for`` ran until the requested duration ran out. Then every tag
+    counted in :class:`SweepResult` was also delivered to the loop. Any earlier
+    exit (``break``, leaving the block without iterating, ``aclose()``,
+    cancellation) is ``STOPPED``, however late the block is left afterwards:
+    consumers derive presence from the tags they iterate, and those may be
+    incomplete.
     """
 
-    #: Stop was sent after the requested duration ran out. The only
+    #: The ``async for`` loop ran to the end of the requested duration. The only
     #: "completed" outcome.
     DURATION_ELAPSED = "duration_elapsed"
-    #: Stop was sent before the requested duration ran out (the block was left
-    #: early, ``aclose()`` was called, the task was cancelled, or an abandoned
-    #: stream was collected), or no duration was given.
+    #: Ended before the loop reached the end of the duration (``break``, block
+    #: left early or without iterating, ``aclose()``, cancellation, an
+    #: abandoned stream), or no duration was given.
     STOPPED = "stopped"
     #: The TCP connection dropped or the client was closed during the sweep.
     CONNECTION_LOST = "connection_lost"

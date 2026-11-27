@@ -323,6 +323,7 @@ async def test_disconnect_fails_pending_and_calls_callback(fake: FakeUR4) -> Non
     await client.reconnect(attempts=3, base_delay=0.01)
     assert is_connected(client)  # helper: mypy narrowed .connected above
     assert await client.get_version() == "V1.2.3"
+    await fake.wait_for_connections(2)
     assert fake.connections == 2
     await client.close()
     await client.close()  # idempotent

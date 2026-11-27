@@ -119,7 +119,10 @@ class InventoryStream:
     the block **always** sends *stop* and waits for the reader's acknowledgement,
     bounded by the client's ``stop_drain``. The stop frame is written
     synchronously, so it goes out even if the task is cancelled again while
-    finishing. Iteration ends by itself when ``duration`` runs out.
+    finishing. Iteration ends by itself when ``duration`` runs out; only then
+    is the sweep ``completed``. Leaving the block any earlier (``break``, not
+    iterating, cancellation) makes it ``stopped``, however late the block is
+    left.
 
     A stream that is iterated without ``async with`` and abandoned (``break``)
     is still stopped, by ``__del__``, but that is a last resort and logs a
@@ -179,7 +182,9 @@ class InventoryStream:
     ) -> None:
         """Send *stop*, wait for the acknowledgement and fill in :attr:`result`."""
         if exc is None or isinstance(exc, asyncio.CancelledError):
-            self._finish_now()  # duration_elapsed or stopped, by timing
+            # Left before the iterator reached the deadline (break, no
+            # iteration, cancellation): stopped, whenever that is.
+            self._finish_now(SweepEndReason.STOPPED)
         elif isinstance(exc, ConnectionLostError):
             self._finish_now(SweepEndReason.CONNECTION_LOST)
         else:
@@ -236,7 +241,12 @@ class InventoryStream:
         self._queue.put_nowait(tag)
 
     async def __anext__(self) -> TagRead:
-        """Return the next tag; stop when the duration runs out."""
+        """Return the next tag; stop when the duration runs out.
+
+        At the deadline, *stop* is sent first and then every tag already
+        received is still handed out, so a completed sweep delivers exactly
+        the reports it counted.
+        """
         if self._finished:
             # Hand out what was already received; a close marker raises.
             try:
@@ -266,43 +276,37 @@ class InventoryStream:
             self._finish_now(SweepEndReason.CONNECTION_LOST)
             raise
         except asyncio.CancelledError:
-            self._finish_now()  # duration_elapsed or stopped, by timing
+            self._finish_now(SweepEndReason.STOPPED)
             raise
         except BaseException as err:
             self._finish_now(SweepEndReason.ERROR, repr(err))
             raise
+        # Only the iterator reaching the deadline completes a sweep.
         self._finish_now(SweepEndReason.DURATION_ELAPSED)
         await self.aclose()
-        raise StopAsyncIteration
+        return await self.__anext__()  # drain what was queued before stop
 
     def _finish_now(
         self, reason: SweepEndReason | None = None, error: str | None = None
     ) -> None:
         """End the sweep now: queue the stop frame and record the result.
 
-        Synchronous, so it can run from ``__del__`` and while cancelled. With
-        ``reason=None`` the reason is worked out from timing: connection lost
-        if the link dropped; otherwise duration elapsed if the deadline had
-        passed when stop is sent, else stopped. A sweep whose connection
-        dropped is not stopped on a later connection.
+        Synchronous, so it can run from ``__del__`` and while cancelled. A
+        dropped connection overrides any reason but ``ERROR``. With
+        ``reason=None`` (``aclose()``) the sweep is ``STOPPED``. Only
+        ``__anext__`` reaching the deadline passes ``DURATION_ELAPSED``. A sweep
+        whose connection dropped is not stopped on a later connection.
         """
         if self._finished:
             return
         self._finished = True
         lost = self._connection_lost or (self._started and not self._client.connected)
-        deadline_passed = (
-            self._deadline is not None and time.monotonic() >= self._deadline
-        )
         if reason is SweepEndReason.ERROR:
             pass
         elif lost:
             reason = SweepEndReason.CONNECTION_LOST
         elif reason is None:
-            reason = (
-                SweepEndReason.DURATION_ELAPSED
-                if deadline_passed
-                else SweepEndReason.STOPPED
-            )
+            reason = SweepEndReason.STOPPED
         if self._started:
             self._stop_sent, self._stop_ack = self._client._end_inventory(
                 self, send_stop=not lost

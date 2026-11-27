@@ -126,6 +126,10 @@ async def on_door_closed() -> None:
 * **Only a `completed` sweep (`end_reason == "duration_elapsed"`) is a full
   read of the cabinet.** Anything else is partial; don't mark items as gone
   because of it.
+* A sweep is `completed` only if your `async for` runs until the duration runs
+  out; then every counted tag has been delivered to the loop. A `break`, or
+  leaving the block without iterating, makes it `stopped` even if you leave
+  the block after the 45 s. Derive presence from the tags you iterate.
 * `result.stop_acknowledged` is false if the reader didn't confirm stop in
   time. The sweep is still valid; log it, and consider `stop_on_connect` or an
   explicit `await client.stop_inventory()` before the next sweep.

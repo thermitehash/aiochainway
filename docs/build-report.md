@@ -19,7 +19,7 @@ No protocol changes. Whether the reader drops idle TCP sessions is recorded as i
 Not done:
 - Nothing is verified on hardware.
 - PyPI publish is still off.
-- The Pantry Hub repo isn't visible to this session, so it hasn't been updated.
+- Pantry Hub (thermitehash/ha-apps, pantry-hub/) is deliberately not changed from this session.
 
 ## Command status
 | Command | CMD/sub | Builder | Reply parser | Status (sdk-derived / inferred) | SDK method |
@@ -73,10 +73,9 @@ Not done:
 4. **Behaviour changes:**
    - `stop_drain` now defaults to `timeout` (was 0.5 s), because exiting a sweep waits for the ack.
    - An abandoned stream stopped by `__del__` now logs a WARNING.
-5. **Sweep end rule** (defined here, not by the SDK):
-   - `duration_elapsed` means stop was sent after the requested duration ran out, with no connection drop or error. It holds whether or not the consumer read every tag, since all reports are counted.
-   - `stopped` means stop was sent before the duration ran out.
-   - `break` inside `async with` ends the loop, not the sweep.
+5. **Sweep end rule** (defined here, not by the SDK; decided by Heather):
+   - `duration_elapsed` (`completed`) means the consumer's `async for` ran until the requested duration ran out, with no connection drop or error. At the deadline, stop is sent and every tag already received is still delivered, so a completed sweep delivers exactly the `reports` it counted.
+   - Any early exit is `stopped` (`completed=False`), however late the block is left afterwards: `break`, leaving the block without iterating, `aclose()`, cancellation. Consumers derive presence from the tags they iterate, so such a sweep can under-report.
 6. Carried over from v0.1.0 (javap vs. starting spec):
    - Reply CMD = request + 1.
    - 0xA2 get replies echo the sub-command, set replies carry a status byte.
@@ -106,8 +105,8 @@ Not done:
    - Is there a serial/MAC read command?
    - DHCP: still waiting on Chainway.
    - What is the USER window unit in inventory mode?
-7. Where does the Pantry Hub repo live? Needed to pin 0.3.0.
-8. When to enable PyPI (PUBLISH_PYPI=true)? Until then, pin via `git+https://github.com/thermitehash/aiochainway@v0.3.0`.
+7. Pantry Hub lives in thermitehash/ha-apps (pantry-hub/). It will pin v0.3.0 after the tag exists; it isn't changed from this session.
+8. PyPI stays off until hardware validation flips rows to verified (decided). Pin via `git+https://github.com/thermitehash/aiochainway@v0.3.0`.
 
 ## Hardware impact
 - Door-driven sweeps run in **command mode**: no UDP destination or auto mode needed. HA → reader on TCP 8888 is the only flow.
@@ -124,8 +123,8 @@ Not done:
   - 2 GPIs, 2 GPOs and 1 relay.
 
 ## Test results
-- Tests: 667/674 (667 passed, 7 skipped by design, 0 failed); 3 consecutive clean full runs. Includes 51 sweep, keepalive and reconnect tests.
-- Coverage: protocol/ 100%, presence 100%, overall 97% (client 94%, testing 98%).
+- Tests: 673/680 (673 passed, 7 skipped by design, 0 failed); 3 consecutive clean full runs. Includes 53 sweep, keepalive and reconnect tests and 5 macOS accept-timing regressions.
+- Coverage: protocol/ 100%, presence 100%, overall 98% (client 94%, testing 98%).
 - Mutation score (protocol/): 92.3% (1566 killed + 4 timeouts of 1701). protocol/ is unchanged since v0.1.0. Survivors: 97 message text, 15 log text, 6 `to_bytes` default byte order, 3 antenna-mask high byte, 2 `pos += 2`, 1 unreachable guard, 1 RSSI rounding, 6 other equivalent changes. All are equivalent or cosmetic; the v0.1.0 report has the details.
 - Fuzzing: Hypothesis CI profile, 6 properties × 2000 examples (12,000), 0 failures.
 
@@ -140,8 +139,8 @@ Not done:
 | 6 | self-review | client.py | `stop_inventory()` overwrote a pending stop-ack future, so a waiting sweep reported no ack | ack futures kept in a list; 0x8D resolves all | test_sweeps::test_all_pending_stop_acks_resolve |
 | 7 | self-review | client.py | a manual `reconnect()` could race the auto-reconnect loop | manual reconnect cancels the auto task first | test_sweeps::test_manual_reconnect_replaces_auto_reconnect |
 | 8 | self-review | client.py | `close()` / `_close_transport()` swallowed the caller's own CancelledError while waiting for tasks | `_cancel_and_wait()` uses `asyncio.wait` | (covered by every close test; race not reproducible) |
-| 9 | self-review (rule) | client.py/models.py | `break` then leaving the block after the deadline reported `completed`; ambiguous | documented timing rule on SweepEndReason; cancellation follows the same rule | test_sweeps::test_break_then_leave_after_deadline_is_completed_by_rule, ::test_break_then_leave_before_deadline_is_stopped, ::test_cancel_after_deadline_is_completed_by_rule |
-| 10 | test (CI, macOS) | testing.py | `FakeUR4.stop()` hung forever on macOS: a connection accepted by the kernel whose handler hadn't run yet was missed, and `server.wait_closed()` waited for it (the macOS job hit GitHub's 6 h limit) | `stop()` refuses late handlers and calls `Server.close_clients()`; CI got a 60 s per-test watchdog that prints task stacks, plus job timeouts | test_testing::test_stop_with_a_connection_whose_handler_has_not_run |
+| 9 | self-review → decision | client.py/models.py | `break` then leaving the block after the deadline reported `completed`, yet the consumer had iterated only part of the tags; tags queued at the deadline were counted but never delivered | only the iterator reaching the deadline completes a sweep; any early exit is `stopped`; at the deadline, stop is sent and queued tags are still delivered | test_sweeps::test_break_before_deadline_then_late_exit_is_stopped, ::test_exit_after_deadline_without_iterating_is_stopped, ::test_cancel_after_deadline_is_stopped, ::test_break_then_leave_before_deadline_is_stopped, ::test_completed_sweep_delivers_every_counted_report |
+| 10 | test (CI, macOS) + watchdog | testing.py (FakeUR4, not library code) | macOS pytest hung until GitHub's 6 h limit. Watchdog dump: the test was stuck in `FakeUR4.stop()` → `server.wait_closed()`, with a late `FakeUR4._handle` reading from a live client. Root cause, shared with #19 and Pantry Hub's macOS FakeUR4 flake: FakeUR4 assumed its accept handler had run by the time the client's `connect()` returned. On macOS (kqueue) it can run later, so `stop()` missed the connection and `wait_closed()` (Python ≥3.12 waits for open connections) never returned | `stop()` refuses handlers that start after it and calls `Server.close_clients()`; new `wait_for_connections(n)` replaces reading `connections` right after a connect; CI: 60 s per-test watchdog printing all asyncio task stacks, faulthandler, verbose output, permanent 20 min job timeout | test_testing::test_stop_with_a_connection_whose_handler_has_not_run, ::test_late_accept_wait_for_connections, ::test_late_accept_drop_connections, ::test_stop_right_after_connect_stress |
 
 ## Risks for hardware bring-up
 1. The reader may not answer commands during an inventory. Keepalive and sweeps don't depend on it, but stop must still be honoured. Covered: stop is written synchronously and a missing ack is recorded (`stop_acknowledged=false`), not raised.

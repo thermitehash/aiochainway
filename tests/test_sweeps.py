@@ -72,13 +72,16 @@ async def test_exit_block_early_is_stopped(client: UR4Client, fake: FakeUR4) -> 
     await fake.wait_for("stop_inventory")
 
 
-async def test_exit_after_deadline_without_iterating_is_completed(
+async def test_exit_after_deadline_without_iterating_is_stopped(
     client: UR4Client,
 ) -> None:
+    # Nothing was iterated, so a consumer has seen no tags: not complete.
     async with client.inventory(duration=0.05) as sweep:
         await asyncio.sleep(0.1)
-    assert sweep.result is not None and sweep.result.completed
-    assert sweep.result.reports > 0  # counted even though not iterated
+    assert sweep.result is not None
+    assert sweep.result.end_reason is SweepEndReason.STOPPED
+    assert not sweep.result.completed
+    assert sweep.result.reports > 0  # the reader did report; counted anyway
 
 
 async def test_no_duration_exit_is_stopped(client: UR4Client) -> None:
@@ -438,6 +441,7 @@ async def test_auto_reconnect_after_drop(fake: FakeUR4) -> None:
     )
     await fake.drop_connections()
     await asyncio.wait_for(reconnected.wait(), 3)
+    await fake.wait_for_connections(2)  # accept may lag connect() on macOS
     assert client.connected and fake.connections == 2
     assert await client.get_version() == "V1.2.3"
     await client.close()
@@ -667,20 +671,25 @@ async def test_break_then_leave_before_deadline_is_stopped(client: UR4Client) ->
     )
 
 
-async def test_break_then_leave_after_deadline_is_completed_by_rule(
+async def test_break_before_deadline_then_late_exit_is_stopped(
     client: UR4Client,
 ) -> None:
-    # Documented rule: the reader ran the full duration and every report was
-    # counted, so the sweep is complete even though the loop broke early.
+    # Decision: any early break is stopped, however late the block is left.
+    # The consumer iterated one tag, so presence from the loop under-reports.
+    loop = asyncio.get_running_loop()
     async with client.inventory(duration=0.1) as sweep:
+        start = loop.time()
         async for _ in sweep:
             break
-        await asyncio.sleep(0.2)
-    assert sweep.result is not None and sweep.result.completed
+        assert loop.time() - start < 0.1  # the break happened before t=duration
+        await asyncio.sleep(0.2)  # ... and the block is left after it
+    assert sweep.result is not None
+    assert sweep.result.end_reason is SweepEndReason.STOPPED
+    assert not sweep.result.completed
     assert sweep.result.reports > 1
 
 
-async def test_cancel_after_deadline_is_completed_by_rule(
+async def test_cancel_after_deadline_is_stopped(
     client: UR4Client, fake: FakeUR4
 ) -> None:
     holder: list[SweepResult | None] = []
@@ -698,7 +707,9 @@ async def test_cancel_after_deadline_is_completed_by_rule(
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert holder[0] is not None and holder[0].completed
+    assert holder[0] is not None
+    assert holder[0].end_reason is SweepEndReason.STOPPED
+    assert not holder[0].completed
 
 
 async def test_no_connection_after_close_while_reconnecting() -> None:
@@ -737,6 +748,7 @@ async def test_manual_reconnect_replaces_auto_reconnect() -> None:
     await fake2.start(port=port)
     await client.reconnect(attempts=5, base_delay=0.01)
     assert auto is not None and auto.done() and client._reconnect_task is None
+    await fake2.wait_for_connections(1)
     assert client.connected and fake2.connections == 1
     await client.close()
     await fake2.stop()
@@ -750,3 +762,27 @@ async def test_all_pending_stop_acks_resolve(client: UR4Client) -> None:
     client._stop_acks.extend([a, b])
     client._dispatch(Frame(0x8D, b"\x01"))
     assert a.done() and b.done() and not client._stop_acks
+
+
+async def test_completed_sweep_delivers_every_counted_report(fake: FakeUR4) -> None:
+    # Presence is derived from iterated tags, so a completed sweep must hand
+    # out everything it counted, including tags queued at the deadline.
+    client = await client_for(fake)
+    fake.tag_interval = 0  # flood: the queue is non-empty at the deadline
+    fake.scenario = [ScriptedTag("AA01"), ScriptedTag("AA02", antennas=(2,))]
+    delivered = 0
+    async with client.inventory(duration=0.1) as sweep:
+        async for _ in sweep:
+            delivered += 1
+    result = sweep.result
+    assert result is not None and result.completed and result.dropped == 0
+    assert delivered == result.reports > 0
+    await client.close()
+
+
+async def test_iterating_past_completion_ends_cleanly(client: UR4Client) -> None:
+    async with client.inventory(duration=0.05) as sweep:
+        async for _ in sweep:
+            pass
+        assert [t async for t in sweep] == []
+    assert sweep.result is not None and sweep.result.completed

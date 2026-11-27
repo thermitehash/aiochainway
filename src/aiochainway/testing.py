@@ -256,7 +256,9 @@ class FakeUR4:
     ``faults`` (fault injection), ``tags`` (records sent during an inventory,
     cycled), ``scenario`` (scripted tags; when set it replaces ``tags``) and
     ``tag_interval`` (seconds between tag frames, or between read rounds of a
-    scenario). ``received`` holds every frame received; :meth:`names` gives
+    scenario). After a client connects, the fake may not have registered the
+    connection yet (the accept handler can run late, notably on macOS); use
+    :meth:`wait_for_connections` rather than reading ``connections`` at once. ``received`` holds every frame received; :meth:`names` gives
     their command names. ``rng`` (seeded) decides scenario read probabilities,
     so runs are repeatable; ``clock`` drives the scenario clock.
     """
@@ -366,6 +368,18 @@ class FakeUR4:
             NAMES.get((f.cmd, f.sub if f.cmd == 0xA1 else None), f"0x{f.cmd:02X}")
             for f in self.received
         ]
+
+    async def wait_for_connections(self, count: int, timeout: float = 3.0) -> None:
+        """Wait until ``count`` connections have been accepted in total.
+
+        Use this instead of reading :attr:`connections` straight after a
+        client's ``connect()``: the kernel completes the handshake before this
+        server's accept handler runs, and on macOS (kqueue) that handler can
+        run noticeably later than on Linux.
+        """
+        async with asyncio.timeout(timeout):
+            while self.connections < count:
+                await self._activity.wait()
 
     async def wait_for(self, name: str, timeout: float = 1.0) -> None:
         """Wait until a command called ``name`` has been received."""
