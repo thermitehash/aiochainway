@@ -81,7 +81,47 @@ reader. Request frames are exact.
 | [ ] | Set IP back | `aiochainway --host 192.168.99.203 network --set --ip 192.168.99.202 --gateway 192.168.99.1 --confirm` | | |
 | [ ] | Factory reset | `ur4 factory-reset --confirm` | `A5 5A 00 08 74 7C 0D 0A` | `A5 5A 00 09 75 01 XX 0D 0A`; **record which settings reset** (IP? destination? power?) |
 
-## E. Questions to answer with the captures
+## E. Door-driven sweeps, idle sessions and power (Pantry Hub v0.3.0)
+
+Run with the reader in command mode, settings from §C restored, and a fixed
+set of tags that does not move between sweeps (tape them inside the cabinet;
+note how many and where).
+
+### E.1 45 s sweep repeatability
+
+| ✓ | Step | CLI | Record |
+|---|---|---|---|
+| [ ] | 10 sweeps of 45 s, 15 s apart | `aiochainway --json sweep --seconds 45 --repeat 10 --pause 15 > captures/sweeps-45s.jsonl` | the `summary` line: `unique_min`, `unique_max`, `unique_mean`, `unique_variance`, `epcs_seen_any`, `epcs_seen_every` |
+| [ ] | Same, door/cabinet closed vs open | as above, two files | difference in `unique_mean` |
+| [ ] | Every sweep ended `duration_elapsed` with `stop_acknowledged: true` | (in the JSONL) | any other end reason or a missing ack |
+| [ ] | Tags never seen in every sweep | compare `epcs_seen_any` vs `epcs_seen_every` | which EPCs flicker, and their antenna (edge of field) |
+
+Pass mark to decide with the data: `epcs_seen_every == ` the number of tags
+placed. If not, raise power or dwell time, or lengthen the sweep, and repeat.
+
+### E.2 Idle TCP session survival
+
+| ✓ | Step | CLI | Record |
+|---|---|---|---|
+| [ ] | Hold an idle connection for 60 min, then ping | `aiochainway --json idle --minutes 60` | `survived`, or `dropped_after_s` (the reader's idle timeout) |
+| [ ] | If it dropped: repeat with a keepalive shorter than that | `python -c` with `UR4Client(..., keepalive_interval_s=<timeout/2>)` | survives? |
+| [ ] | Ping after a reader power cycle without reconnecting | power-cycle, then `aiochainway ping` from the old session (or watch `auto_reconnect`) | how long until a dead link is noticed |
+
+Pantry Hub's choice depends on this row: keep one connection open with
+`keepalive_interval_s`, or connect per sweep with `stop_on_connect=True`.
+
+### E.3 Power draw
+
+| ✓ | Step | How | Record |
+|---|---|---|---|
+| [ ] | Idle, command mode, no inventory | PoE switch port readout (W) or an inline PoE/plug meter | W |
+| [ ] | During a 45 s sweep at the power used in E.1 | same, read mid-sweep | W (peak and typical) |
+| [ ] | During a sweep at 30 dBm on all 4 antennas | same | W |
+| [ ] | Boot | same, from power-on to `ping` answering | peak W, seconds to ready |
+
+Compare with the PoE budget of the switch port (802.3af 15.4 W / at 30 W).
+
+## F. Questions to answer with the captures
 
 1. Does start inventory (`82`) get a reply frame?
 2. In auto mode, does the reader still accept TCP commands, and does it also push
@@ -91,4 +131,6 @@ reader. Request frames are exact.
 5. What is byte 1 of the get-antenna-dwell reply (`4D`)?
 6. Factory reset: which settings return to defaults?
 7. How often does the reader announce itself on UDP 1111?
-8. PoE: does the reader boot from your switch (802.3af vs at)?
+8. PoE: does the reader boot from your switch (802.3af vs at)? (Power figures: §E.3.)
+9. Does the reader drop idle TCP sessions, and after how long? (§E.2.)
+10. How repeatable is a 45 s sweep over a static tag set? (§E.1.)

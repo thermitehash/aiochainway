@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterable, Mapping
 import contextlib
+import dataclasses
 import logging
 import random
 import time
@@ -24,6 +25,8 @@ from .models import (
     ReaderInfo,
     ReaderNetworkConfig,
     RfLink,
+    SweepEndReason,
+    SweepResult,
     TagRead,
     TagSource,
     TriggerConfig,
@@ -48,13 +51,12 @@ from .protocol.tags import parse_tag_record
 _LOGGER = logging.getLogger("aiochainway")
 
 DEFAULT_TIMEOUT = 3.0
-#: How long to wait for the stop acknowledgement (0x8D) after an inventory.
-DEFAULT_STOP_DRAIN = 0.5
 #: Tags buffered during an inventory before the oldest are dropped.
 DEFAULT_TAG_QUEUE = 10_000
 _READ_CHUNK = 4096
 
 DisconnectCallback = Callable[[BaseException | None], None]
+ReconnectCallback = Callable[[], None]
 
 
 def check_guard(name: str, *, confirm: bool, allow_unverified: bool) -> None:
@@ -88,6 +90,14 @@ def _ack_abandoned(ack: asyncio.Future[None]) -> bool:
     return ack.cancelled() and (task is None or task.cancelling() == 0)
 
 
+async def _cancel_and_wait(task: asyncio.Task[None] | None) -> None:
+    """Cancel ``task`` and wait for it, without swallowing our own cancellation."""
+    if task is None or task is asyncio.current_task() or task.done():
+        return
+    task.cancel()
+    await asyncio.wait([task])
+
+
 class _Closed:
     """Sentinel put in the tag queue when the connection drops."""
 
@@ -96,17 +106,31 @@ _CLOSED = _Closed()
 
 
 class InventoryStream:
-    """Async iterator over tags from one continuous inventory.
+    """One continuous inventory ("sweep"): an async context manager and iterator.
 
-    Created by :meth:`UR4Client.inventory`. It sends *start* on first use and
-    **always** sends *stop* when it ends: on duration expiry, ``break``,
-    cancellation, an exception, ``aclose()`` or garbage collection. The stop
-    frame is written synchronously, so it is queued even if the task is
-    cancelled again while finishing.
+    Created by :meth:`UR4Client.inventory`. Use it as a context manager::
+
+        async with client.inventory(duration=45) as stream:
+            async for tag in stream:
+                ...
+        print(stream.result.end_reason, stream.result.unique_count)
+
+    *Start* is sent on entering the block (or on the first iteration). Leaving
+    the block **always** sends *stop* and waits for the reader's acknowledgement,
+    bounded by the client's ``stop_drain``. The stop frame is written
+    synchronously, so it goes out even if the task is cancelled again while
+    finishing. Iteration ends by itself when ``duration`` runs out; only then
+    is the sweep ``completed``. Leaving the block any earlier (``break``, not
+    iterating, cancellation) makes it ``stopped``, however late the block is
+    left.
+
+    A stream that is iterated without ``async with`` and abandoned (``break``)
+    is still stopped, by ``__del__``, but that is a last resort and logs a
+    WARNING. After the stream has ended, :attr:`result` describes the sweep.
     """
 
     def __init__(self, client: UR4Client, duration: float | None) -> None:
-        """Bind to ``client``; nothing is sent until iteration starts."""
+        """Bind to ``client``; nothing is sent until the block or iteration starts."""
         # Set first: __del__ may run on a half-constructed object.
         self._started = False
         self._finished = True
@@ -114,21 +138,39 @@ class InventoryStream:
             raise ValidationError(f"duration must be positive, got {duration!r}")
         self._client = client
         self._duration = duration
-        self._queue: asyncio.Queue[TagRead | _Closed] = asyncio.Queue(
-            client.tag_queue_size
-        )
-        self._deadline: float | None = None
-        self._finished = False
+        # Unbounded: the tag limit is enforced in _offer so the close marker
+        # can always be queued without evicting a tag.
+        self._queue: asyncio.Queue[TagRead | _Closed] = asyncio.Queue()
+        self._max_tags = client.tag_queue_size
+        self._deadline: float | None = None  # time.monotonic() based
         self._stop_ack: asyncio.Future[None] | None = None
-        #: Tags dropped because the queue was full.
+        self._stop_sent = False
+        self._connection_lost = False
+        self._started_at: float | None = None
+        self._reports = 0
+        self._epcs: set[str] = set()
+        self._per_antenna: dict[int, int] = {}
+        self._result: SweepResult | None = None
+        #: Tags dropped because the consumer was too slow and the queue was full.
         self.dropped = 0
+        self._finished = False
+
+    @property
+    def result(self) -> SweepResult | None:
+        """The sweep summary, or ``None`` while the stream has not ended."""
+        return self._result
+
+    @property
+    def running(self) -> bool:
+        """Whether start was sent and the stream has not ended."""
+        return self._started and not self._finished
 
     def __aiter__(self) -> Self:
         """Return self."""
         return self
 
     async def __aenter__(self) -> Self:
-        """Start the inventory now."""
+        """Send *start*."""
         await self._start()
         return self
 
@@ -138,27 +180,57 @@ class InventoryStream:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        """Stop the inventory."""
+        """Send *stop*, wait for the acknowledgement and fill in :attr:`result`."""
+        if exc is None or isinstance(exc, asyncio.CancelledError):
+            # Left before the iterator reached the deadline (break, no
+            # iteration, cancellation): stopped, whenever that is.
+            self._finish_now(SweepEndReason.STOPPED)
+        elif isinstance(exc, ConnectionLostError):
+            self._finish_now(SweepEndReason.CONNECTION_LOST)
+        else:
+            self._finish_now(SweepEndReason.ERROR, repr(exc))
         await self.aclose()
 
     async def _start(self) -> None:
-        if self._started:
+        if self._started or self._finished:
             return
         client = self._client
-        client._begin_inventory(self)  # raises if another inventory is running
+        try:
+            client._begin_inventory(self)  # raises if another inventory is running
+        except ChainwayError as err:
+            self._finish_now(SweepEndReason.ERROR, repr(err))
+            raise
         self._started = True
         try:
             await client._send_only(c.build_start_inventory())
-        except BaseException:
-            self._finish_now()
+        except ConnectionLostError:
+            self._finish_now(SweepEndReason.CONNECTION_LOST)
             raise
-        loop = asyncio.get_running_loop()
+        except asyncio.CancelledError:
+            self._finish_now(SweepEndReason.STOPPED)
+            raise
+        except BaseException as err:
+            self._finish_now(SweepEndReason.ERROR, repr(err))
+            raise
+        self._started_at = time.time()
         if self._duration is not None:
-            self._deadline = loop.time() + self._duration
+            self._deadline = time.monotonic() + self._duration
 
-    def _offer(self, tag: TagRead | _Closed) -> None:
+    def _mark_lost(self) -> None:
+        """Record a dropped connection once and wake the consumer."""
+        if self._connection_lost:
+            return
+        self._connection_lost = True
+        self._queue.put_nowait(_CLOSED)
+
+    def _offer(self, tag: TagRead) -> None:
         """Queue a tag from the reader task, dropping the oldest when full."""
-        if self._queue.full():
+        if self._finished or self._connection_lost:
+            return
+        self._reports += 1
+        self._epcs.add(tag.epc)
+        self._per_antenna[tag.antenna] = self._per_antenna.get(tag.antenna, 0) + 1
+        if self._max_tags > 0 and self._queue.qsize() >= self._max_tags:
             with contextlib.suppress(asyncio.QueueEmpty):
                 self._queue.get_nowait()
             self.dropped += 1
@@ -169,7 +241,12 @@ class InventoryStream:
         self._queue.put_nowait(tag)
 
     async def __anext__(self) -> TagRead:
-        """Return the next tag; stop at the deadline."""
+        """Return the next tag; stop when the duration runs out.
+
+        At the deadline, *stop* is sent first and then every tag already
+        received is still handed out, so a completed sweep delivers exactly
+        the reports it counted.
+        """
         if self._finished:
             # Hand out what was already received; a close marker raises.
             try:
@@ -184,7 +261,7 @@ class InventoryStream:
             while True:
                 timeout: float | None = None
                 if self._deadline is not None:
-                    timeout = self._deadline - asyncio.get_running_loop().time()
+                    timeout = self._deadline - time.monotonic()
                     if timeout <= 0:
                         break
                 try:
@@ -195,31 +272,76 @@ class InventoryStream:
                 if isinstance(item, _Closed):
                     raise ConnectionLostError("connection lost during inventory")
                 return item
-        except BaseException:
-            self._finish_now()
+        except ConnectionLostError:
+            self._finish_now(SweepEndReason.CONNECTION_LOST)
             raise
+        except asyncio.CancelledError:
+            self._finish_now(SweepEndReason.STOPPED)
+            raise
+        except BaseException as err:
+            self._finish_now(SweepEndReason.ERROR, repr(err))
+            raise
+        # Only the iterator reaching the deadline completes a sweep.
+        self._finish_now(SweepEndReason.DURATION_ELAPSED)
         await self.aclose()
-        raise StopAsyncIteration
+        return await self.__anext__()  # drain what was queued before stop
 
-    def _finish_now(self) -> None:
-        """End the inventory now and queue the stop frame (synchronous)."""
-        if self._finished or not self._started:
-            self._finished = True
+    def _finish_now(
+        self, reason: SweepEndReason | None = None, error: str | None = None
+    ) -> None:
+        """End the sweep now: queue the stop frame and record the result.
+
+        Synchronous, so it can run from ``__del__`` and while cancelled. A
+        dropped connection overrides any reason but ``ERROR``. With
+        ``reason=None`` (``aclose()``) the sweep is ``STOPPED``. Only
+        ``__anext__`` reaching the deadline passes ``DURATION_ELAPSED``. A sweep
+        whose connection dropped is not stopped on a later connection.
+        """
+        if self._finished:
             return
         self._finished = True
-        self._stop_ack = self._client._end_inventory(self)
+        lost = self._connection_lost or (self._started and not self._client.connected)
+        if reason is SweepEndReason.ERROR:
+            pass
+        elif lost:
+            reason = SweepEndReason.CONNECTION_LOST
+        elif reason is None:
+            reason = SweepEndReason.STOPPED
+        if self._started:
+            self._stop_sent, self._stop_ack = self._client._end_inventory(
+                self, send_stop=not lost
+            )
+        self._result = SweepResult(
+            end_reason=reason,
+            started_at=self._started_at,
+            ended_at=time.time(),
+            reports=self._reports,
+            unique_epcs=frozenset(self._epcs),
+            per_antenna_counts=dict(sorted(self._per_antenna.items())),
+            requested_duration=self._duration,
+            dropped=self.dropped,
+            stop_sent=self._stop_sent,
+            stop_acknowledged=False,
+            error=error,
+        )
 
     async def aclose(self) -> None:
-        """Stop the inventory and wait briefly for the reader's acknowledgement."""
+        """Stop the sweep and wait for the reader's acknowledgement.
+
+        The wait is bounded by the client's ``stop_drain``; a missing
+        acknowledgement is recorded in :attr:`result`, not raised.
+        """
         self._finish_now()
         ack, self._stop_ack = self._stop_ack, None
         if ack is None:
             return
+        acknowledged = False
         try:
             async with asyncio.timeout(self._client.stop_drain):
                 await asyncio.shield(ack)
+            acknowledged = True
         except TimeoutError:
-            _LOGGER.debug(
+            _LOGGER.info(
                 "No stop acknowledgement (0x8D) within %ss", self._client.stop_drain
             )
         except asyncio.CancelledError:
@@ -229,12 +351,22 @@ class InventoryStream:
         finally:
             if not ack.done():
                 ack.cancel()
+        if acknowledged and self._result is not None:
+            self._result = dataclasses.replace(self._result, stop_acknowledged=True)
 
     def __del__(self) -> None:
-        """Last resort: queue the stop frame if the stream was abandoned."""
+        """Last resort: stop an abandoned stream, and say so."""
         if self._started and not self._finished:
+            with contextlib.suppress(Exception):
+                _LOGGER.warning(
+                    "Inventory stream on %s:%s was abandoned without being closed; "
+                    "stop was sent from the garbage collector. Use "
+                    "`async with client.inventory(...) as stream:`",
+                    self._client.host,
+                    self._client.port,
+                )
             with contextlib.suppress(RuntimeError):
-                self._finish_now()
+                self._finish_now(SweepEndReason.STOPPED)
 
 
 class UR4Client:
@@ -248,9 +380,15 @@ class UR4Client:
 
         async with UR4Client("192.168.99.202") as reader:
             print(await reader.get_version())
-            async for tag in reader.inventory(duration=5):
-                print(tag.epc, tag.rssi_dbm, tag.antenna)
+            async with reader.inventory(duration=5) as sweep:
+                async for tag in sweep:
+                    print(tag.epc, tag.rssi_dbm, tag.antenna)
+            print(sweep.result)
 
+    Long-lived connections (e.g. a door-driven sweep every few hours): set
+    ``keepalive_interval_s`` to ping the reader when the link has been idle
+    that long (a ping that times out drops the connection so it is noticed),
+    and ``auto_reconnect=True`` to reconnect with backoff after a drop.
     """
 
     def __init__(
@@ -261,22 +399,51 @@ class UR4Client:
         *,
         connect_timeout: float | None = None,
         on_disconnect: DisconnectCallback | None = None,
-        stop_drain: float = DEFAULT_STOP_DRAIN,
+        on_reconnect: ReconnectCallback | None = None,
+        stop_drain: float | None = None,
         strict_tags: bool = True,
         tag_queue_size: int = DEFAULT_TAG_QUEUE,
         stale_window: float | None = None,
+        stop_on_connect: bool = False,
+        keepalive_interval_s: float | None = None,
+        auto_reconnect: bool = False,
+        reconnect_base_delay: float = 0.5,
+        reconnect_max_delay: float = 60.0,
     ) -> None:
-        """Configure the client; call :meth:`connect` or use ``async with``."""
+        """Configure the client; call :meth:`connect` or use ``async with``.
+
+        ``stop_drain`` bounds the wait for the stop acknowledgement (default:
+        ``timeout``). ``stop_on_connect`` sends *stop inventory* after every
+        (re)connect, as Chainway's SDK does, to clear a reader left running.
+        ``keepalive_interval_s`` (default off) pings the reader after that many
+        idle seconds. ``auto_reconnect`` (default off) reconnects with
+        exponential backoff and jitter after an unexpected drop, then calls
+        ``on_reconnect``.
+        """
         if timeout <= 0:
             raise ValidationError("timeout must be positive")
         if not 1 <= port <= 0xFFFF:
             raise ValidationError(f"port must be 1-65535, got {port!r}")
+        if keepalive_interval_s is not None and not keepalive_interval_s > 0:
+            raise ValidationError("keepalive_interval_s must be positive")
         self.host = host
         self.port = port
         self.timeout = timeout
         self.connect_timeout = connect_timeout or timeout
         self.on_disconnect = on_disconnect
-        self.stop_drain = stop_drain
+        self.on_reconnect = on_reconnect
+        self.stop_drain = stop_drain if stop_drain is not None else timeout
+        self.stop_on_connect = stop_on_connect
+        self.keepalive_interval_s = keepalive_interval_s
+        self.auto_reconnect = auto_reconnect
+        self.reconnect_base_delay = reconnect_base_delay
+        self.reconnect_max_delay = reconnect_max_delay
+        self._keepalive_task: asyncio.Task[None] | None = None
+        self._reconnect_task: asyncio.Task[None] | None = None
+        self._last_activity = time.monotonic()
+        #: Keepalive pings sent / failed since the client was created.
+        self.keepalive_pings = 0
+        self.keepalive_failures = 0
         self.strict_tags = strict_tags
         self.tag_queue_size = tag_queue_size
         #: How long a late reply to a timed-out/cancelled request is waited for.
@@ -292,7 +459,8 @@ class UR4Client:
         # Weak, so an abandoned stream (``break`` out of ``async for``) is
         # finalised at once and its __del__ sends stop.
         self._inventory_ref: weakref.ref[InventoryStream] | None = None
-        self._stop_ack: asyncio.Future[None] | None = None
+        #: Futures waiting for the next stop acknowledgement (0x8D).
+        self._stop_acks: list[asyncio.Future[None]] = []
         self._decoder = FrameDecoder()
         self._closing = False
         #: Frames received that matched no request and were dropped.
@@ -329,8 +497,12 @@ class UR4Client:
         """Close."""
         await self.close()
 
-    async def connect(self) -> None:
+    async def connect(self, *, retries: int = 0) -> None:
         """Open the TCP connection and start the receive task.
+
+        With ``retries > 0``, failed attempts are retried with exponential
+        backoff and jitter (see :meth:`reconnect`). With ``stop_on_connect``,
+        *stop inventory* is sent once connected.
 
         Raises:
             ReaderTimeout: the connection did not open within ``connect_timeout``.
@@ -339,6 +511,18 @@ class UR4Client:
         """
         if self.connected:
             return
+        self._closing = False
+        if retries > 0:
+            await self.reconnect(
+                attempts=retries + 1,
+                base_delay=self.reconnect_base_delay,
+                max_delay=self.reconnect_max_delay,
+            )
+            return
+        await self._open()
+
+    async def _open(self) -> None:
+        """One connection attempt."""
         await self._close_transport()
         try:
             async with asyncio.timeout(self.connect_timeout):
@@ -353,11 +537,22 @@ class UR4Client:
             ) from err
         self._reader, self._writer = reader, writer
         self._decoder = FrameDecoder()
-        self._closing = False
+        self._touch()
         self._read_task = asyncio.create_task(
             self._read_loop(reader), name=f"aiochainway-read-{self.host}"
         )
         _LOGGER.debug("Connected to %s:%s", self.host, self.port)
+        if self.stop_on_connect:
+            try:
+                await self.stop_inventory()
+            except BaseException:
+                await self._close_transport()
+                raise
+        if self.keepalive_interval_s is not None:
+            self._keepalive_task = asyncio.create_task(
+                self._keepalive_loop(self.keepalive_interval_s),
+                name=f"aiochainway-keepalive-{self.host}",
+            )
 
     async def reconnect(
         self,
@@ -371,11 +566,18 @@ class UR4Client:
         ``attempts=None`` retries forever; otherwise the last error is raised as
         :class:`ConnectionLostError` after that many failures.
         """
+        if self._reconnect_task is not asyncio.current_task():
+            # A manual reconnect replaces a running auto-reconnect.
+            task, self._reconnect_task = self._reconnect_task, None
+            await _cancel_and_wait(task)
+            self._closing = False
         await self._close_transport()
         attempt = 0
         while True:
+            if self._is_closing():
+                raise ConnectionLostError("client closed during reconnect")
             try:
-                await self.connect()
+                await self._open()
             except (ConnectionLostError, ReaderTimeout) as err:
                 attempt += 1
                 if attempts is not None and attempt >= attempts:
@@ -392,6 +594,9 @@ class UR4Client:
                 )
                 await asyncio.sleep(delay)
             else:
+                if self._is_closing():  # close() raced the successful attempt
+                    await self._close_transport()
+                    raise ConnectionLostError("client closed during reconnect")
                 return
 
     async def close(self) -> None:
@@ -401,20 +606,22 @@ class UR4Client:
         the socket closes).
         """
         self._closing = True
+        task, self._reconnect_task = self._reconnect_task, None
+        await _cancel_and_wait(task)
         stream = self._inventory
         if stream is not None:
-            stream._finish_now()  # queues the stop frame and detaches the stream
-            stream._offer(_CLOSED)  # wake a consumer blocked on the queue
+            # Queue the stop frame and detach; closing ends the sweep.
+            stream._finish_now(SweepEndReason.CONNECTION_LOST)
+            stream._mark_lost()  # wake a consumer blocked on the queue
         await self._close_transport()
 
     async def _close_transport(self) -> None:
+        keepalive, self._keepalive_task = self._keepalive_task, None
+        await _cancel_and_wait(keepalive)
         task, self._read_task = self._read_task, None
         writer, self._writer = self._writer, None
         self._reader = None
-        if task is not None and not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        await _cancel_and_wait(task)
         if writer is not None:
             writer.close()
             with contextlib.suppress(OSError, ConnectionError):
@@ -426,13 +633,18 @@ class UR4Client:
             _, fut = self._pending
             if not fut.done():
                 fut.set_exception(err)
-        if self._stop_ack is not None and not self._stop_ack.done():
+        acks, self._stop_acks = self._stop_acks, []
+        for ack in acks:
             # Nobody may be awaiting it; cancel rather than set an exception
             # that would be reported as "never retrieved".
-            self._stop_ack.cancel()
-        self._stop_ack = None
-        if self._inventory is not None:
-            self._inventory._offer(_CLOSED)
+            if not ack.done():
+                ack.cancel()
+        stream = self._inventory
+        if stream is not None:
+            # Detach: the sweep is over; a reconnect must not feed it or be
+            # blocked by it.
+            self._inventory_ref = None
+            stream._mark_lost()
 
     async def _read_loop(self, reader: asyncio.StreamReader) -> None:
         error: BaseException | None = None
@@ -441,6 +653,7 @@ class UR4Client:
                 chunk = await reader.read(_READ_CHUNK)
                 if not chunk:
                     break
+                self._touch()
                 if _LOGGER.isEnabledFor(logging.DEBUG):
                     _LOGGER.debug("<< %s", hexdump(chunk))
                 for frame in self._decoder.feed(chunk):
@@ -467,15 +680,81 @@ class UR4Client:
                 self.on_disconnect(error)
             except Exception:
                 _LOGGER.exception("on_disconnect callback raised")
+        if self.auto_reconnect and not self._closing and self._reconnect_task is None:
+            self._reconnect_task = asyncio.create_task(
+                self._auto_reconnect(), name=f"aiochainway-reconnect-{self.host}"
+            )
+
+    async def _auto_reconnect(self) -> None:
+        """Background task: reconnect with backoff until it works or close()."""
+        try:
+            await self.reconnect(
+                attempts=None,
+                base_delay=self.reconnect_base_delay,
+                max_delay=self.reconnect_max_delay,
+            )
+        except ChainwayError as err:  # e.g. ValidationError for a bad host
+            _LOGGER.error(
+                "Auto-reconnect to %s:%s gave up: %s", self.host, self.port, err
+            )
+            return
+        finally:
+            if self._reconnect_task is asyncio.current_task():
+                self._reconnect_task = None
+        _LOGGER.info("Reconnected to %s:%s", self.host, self.port)
+        if self.on_reconnect is not None:
+            try:
+                self.on_reconnect()
+            except Exception:
+                _LOGGER.exception("on_reconnect callback raised")
+
+    def _is_closing(self) -> bool:
+        # A method, not the attribute: close() may set it while we await.
+        return self._closing
+
+    def _touch(self) -> None:
+        self._last_activity = time.monotonic()
+
+    @property
+    def idle_seconds(self) -> float:
+        """Seconds since anything was last sent to or received from the reader."""
+        return time.monotonic() - self._last_activity
+
+    async def _keepalive_loop(self, interval: float) -> None:
+        """Background task: ping after ``interval`` idle seconds."""
+        while True:
+            await asyncio.sleep(max(interval - self.idle_seconds, 0.05))
+            busy = self._lock.locked() or self._inventory is not None or self._stop_acks
+            if self.idle_seconds < interval or busy:
+                continue
+            self.keepalive_pings += 1
+            try:
+                await self.ping()
+            except ConnectionLostError:
+                return  # the receive task reports the drop
+            except ReaderTimeout:
+                self.keepalive_failures += 1
+                _LOGGER.warning(
+                    "Keepalive ping to %s:%s timed out; dropping the connection",
+                    self.host,
+                    self.port,
+                )
+                if self._writer is not None:
+                    self._writer.transport.abort()
+                return
+            except ChainwayError as err:
+                self.keepalive_failures += 1
+                _LOGGER.warning("Keepalive ping failed: %s", err)
 
     def _dispatch(self, frame: Frame) -> None:
         if frame.cmd == c.CMD_TAG_REPORT:
             self._dispatch_tag(frame)
             return
-        if frame.cmd == 0x8D and self._stop_ack is not None:
-            ack, self._stop_ack = self._stop_ack, None
-            if not ack.done():
-                ack.set_result(None)
+        if frame.cmd == 0x8D and self._stop_acks:
+            acks, self._stop_acks = self._stop_acks, []
+            for ack in acks:
+                if not ack.done():
+                    ack.set_result(None)
             return
         key = c.reply_key(frame)
         stale = self._stale.pop(key, None)
@@ -518,6 +797,7 @@ class UR4Client:
             _LOGGER.debug(">> %s  (%s)", hexdump(data), name)
         try:
             writer.write(data)
+            self._touch()
             async with asyncio.timeout(self.timeout):
                 await writer.drain()
         except TimeoutError as err:
@@ -585,30 +865,37 @@ class UR4Client:
         self._require_writer()
         self._inventory_ref = weakref.ref(stream)
 
-    def _end_inventory(self, stream: InventoryStream) -> asyncio.Future[None] | None:
-        """Detach ``stream`` and synchronously queue the stop frame."""
-        current = self._inventory
-        if current is stream or current is None:
+    def _end_inventory(
+        self, stream: InventoryStream, *, send_stop: bool = True
+    ) -> tuple[bool, asyncio.Future[None] | None]:
+        """Detach ``stream`` and synchronously queue the stop frame.
+
+        Returns whether the frame was written and a future for its ack.
+        """
+        if self._inventory is stream:
             self._inventory_ref = None
+        if not send_stop:
+            return False, None
         writer = self._writer
         if writer is None or writer.is_closing():
             _LOGGER.debug("Inventory ended without a connection; stop not sent")
-            return None
+            return False, None
         data = c.build_stop_inventory().encode()
         ack: asyncio.Future[None] | None = None
         with contextlib.suppress(RuntimeError):
             ack = asyncio.get_running_loop().create_future()
-            previous, self._stop_ack = self._stop_ack, ack
-            if previous is not None and not previous.done():
-                previous.cancel()
+            self._stop_acks.append(ack)
         if _LOGGER.isEnabledFor(logging.DEBUG):
             _LOGGER.debug(">> %s  (stop_inventory)", hexdump(data))
         try:
             writer.write(data)
         except (OSError, ConnectionError, RuntimeError) as err:
             _LOGGER.debug("Could not send stop_inventory: %s", err)
-            return None
-        return ack
+            if ack is not None:
+                ack.cancel()
+            return False, None
+        self._touch()
+        return True, ack
 
     # Inventory ---------------------------------------------------------------
 
@@ -636,11 +923,12 @@ class UR4Client:
             writer = self._require_writer()
             loop = asyncio.get_running_loop()
             ack: asyncio.Future[None] = loop.create_future()
-            self._stop_ack = ack
+            self._stop_acks.append(ack)
             data = c.build_stop_inventory().encode()
             if _LOGGER.isEnabledFor(logging.DEBUG):
                 _LOGGER.debug(">> %s  (stop_inventory)", hexdump(data))
             writer.write(data)
+            self._touch()
             try:
                 async with asyncio.timeout(self.stop_drain):
                     await asyncio.shield(ack)
@@ -653,14 +941,26 @@ class UR4Client:
                     "connection lost while waiting for the stop acknowledgement"
                 ) from None
             finally:
-                if self._stop_ack is ack:
-                    self._stop_ack = None
+                if ack in self._stop_acks:
+                    self._stop_acks.remove(ack)
 
     # Read commands -----------------------------------------------------------
 
     async def get_version(self) -> str:
         """Return the firmware version string, e.g. ``"V1.2.3"``."""
         return c.parse_get_version(await self._request(c.build_get_version()))
+
+    async def ping(self) -> float:
+        """Round-trip a firmware-version request; return the latency in seconds.
+
+        Raises:
+            ReaderTimeout: no reply within ``timeout``.
+            ConnectionLostError: not connected.
+
+        """
+        start = time.monotonic()
+        await self.get_version()
+        return time.monotonic() - start
 
     async def get_temperature(self) -> float:
         """Return the UHF module temperature in °C."""

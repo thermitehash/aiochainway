@@ -28,7 +28,8 @@ record parser, `c.b`/`c.f` = frame splitter and UR4 data handler, `UR4` =
 | Connect timeout | 5000 ms | `c.<init>` constant | sdk-derived |
 | Reply timeout | 2000 ms default per command | `c.sendAndReceive([B)` | sdk-derived |
 | Stale replies | the SDK discards queued replies older than 5000 ms | `c.b.a(int,int)` | sdk-derived |
-| On connect | the SDK sends **stop inventory** first, then marks the reader powered | `UR4.init(String,int)` | sdk-derived |
+| On connect | the SDK sends **stop inventory** first, then marks the reader powered (`aiochainway`: opt-in `stop_on_connect=True`) | `UR4.init(String,int)` | sdk-derived |
+| Idle TCP sessions | whether the reader closes an idle command connection, and after how long, is **unknown**; the SDK has a connection-state checker but no keepalive command (`aiochainway`: opt-in `keepalive_interval_s`, using get-version as the ping) | `c.setAutoCheckConnectStatus` | inferred |
 | Auto/trigger mode data | UDP, reader → configured destination | `SocketUdp`, `UR4.startReciveUHFTagsByUDP` | sdk-derived |
 | UDP receive buffer | 1024-byte datagrams, fed into **one** shared stream splitter (frames may span datagrams; several frames per datagram are fine) | `SocketUdp$ThreadUdpReceive.run`, `c.b.a([B)` | sdk-derived |
 | Device discovery | reader broadcasts on UDP **1111**; host only listens | `SocketUdpUR4SearchDevice` | sdk-derived (passive listen); announcement format below |

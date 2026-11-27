@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aiochainway"
-version = "0.2.0"
+version = "0.3.0"
 description = "Async Python library for Chainway UR4 fixed UHF RFID readers. TCP command and UDP auto-mode inventory, no dependencies. Unofficial; not affiliated with Chainway."
 readme = "README.md"
 license = "MIT"
@@ -83,6 +83,7 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "-p no:cacheprovider"
+faulthandler_timeout = 120
 filterwarnings = [
     "error::pytest.PytestUnraisableExceptionWarning",
     "error::RuntimeWarning",

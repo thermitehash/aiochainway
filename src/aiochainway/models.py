@@ -367,3 +367,71 @@ class NetworkChangeResult:
             "Reconnect at the new address and read the settings back to verify."
         )
     )
+
+
+class SweepEndReason(StrEnum):
+    """Why an inventory sweep ended (:attr:`SweepResult.end_reason`).
+
+    A sweep is ``DURATION_ELAPSED`` (``completed``) only when the consumer's
+    ``async for`` ran until the requested duration ran out. Then every tag
+    counted in :class:`SweepResult` was also delivered to the loop. Any earlier
+    exit (``break``, leaving the block without iterating, ``aclose()``,
+    cancellation) is ``STOPPED``, however late the block is left afterwards:
+    consumers derive presence from the tags they iterate, and those may be
+    incomplete.
+    """
+
+    #: The ``async for`` loop ran to the end of the requested duration. The only
+    #: "completed" outcome.
+    DURATION_ELAPSED = "duration_elapsed"
+    #: Ended before the loop reached the end of the duration (``break``, block
+    #: left early or without iterating, ``aclose()``, cancellation, an
+    #: abandoned stream), or no duration was given.
+    STOPPED = "stopped"
+    #: The TCP connection dropped or the client was closed during the sweep.
+    CONNECTION_LOST = "connection_lost"
+    #: The sweep failed to start, or the consumer's code raised inside it.
+    ERROR = "error"
+
+
+@dataclass(frozen=True, slots=True)
+class SweepResult:
+    """Summary of one inventory sweep, available once the stream has ended.
+
+    ``started_at``/``ended_at`` are UNIX timestamps (``started_at`` is ``None``
+    if start was never sent). ``reports`` counts every tag report received,
+    including repeats and reports dropped because the consumer was too slow
+    (``dropped``). ``per_antenna_counts`` maps antenna → reports.
+    """
+
+    end_reason: SweepEndReason
+    started_at: float | None
+    ended_at: float
+    reports: int = 0
+    unique_epcs: frozenset[str] = frozenset()
+    per_antenna_counts: dict[int, int] = field(default_factory=dict)
+    requested_duration: float | None = None
+    dropped: int = 0
+    #: The stop frame was written to the socket.
+    stop_sent: bool = False
+    #: The reader acknowledged stop (0x8D) within the client's ``stop_drain``.
+    stop_acknowledged: bool = False
+    #: ``repr`` of the exception for :attr:`SweepEndReason.ERROR`.
+    error: str | None = None
+
+    @property
+    def completed(self) -> bool:
+        """Whether the sweep ran for its full requested duration."""
+        return self.end_reason is SweepEndReason.DURATION_ELAPSED
+
+    @property
+    def unique_count(self) -> int:
+        """Number of distinct EPCs seen."""
+        return len(self.unique_epcs)
+
+    @property
+    def elapsed(self) -> float | None:
+        """Seconds from start to end, or ``None`` if it never started."""
+        if self.started_at is None:
+            return None
+        return self.ended_at - self.started_at

@@ -25,9 +25,12 @@ It needs only the standard library and opens sockets on ``127.0.0.1`` only.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 import contextlib
 from dataclasses import dataclass, field
 import ipaddress
+import random
+import time
 from types import TracebackType
 from typing import Self
 
@@ -40,6 +43,7 @@ __all__ = [
     "FakeUR4",
     "Faults",
     "ReaderState",
+    "ScriptedTag",
     "tag_frames",
     "tag_record",
 ]
@@ -93,6 +97,57 @@ def tag_frames(*records: bytes) -> bytes:
     return b"".join(encode(CMD_TAG_REPORT, record) for record in records)
 
 
+@dataclass(frozen=True)
+class ScriptedTag:
+    """A tag in a scripted scenario (:attr:`FakeUR4.scenario`).
+
+    Times are seconds on the fake's scenario clock (:meth:`FakeUR4.elapsed`,
+    zero when the fake starts or :meth:`FakeUR4.reset_clock` is called), so a
+    scenario can span several sweeps: a tag with ``present_until=10`` is seen by
+    a sweep at t=0 and missing from a sweep at t=20.
+
+    In every read round (each ``tag_interval`` during an inventory) a present
+    tag is reported with probability ``read_probability`` (below 1 simulates
+    edge-of-field flicker), on each of its ``antennas`` that is enabled in
+    :attr:`ReaderState.antenna_mask`.
+    """
+
+    epc: str
+    antennas: tuple[int, ...] = (1,)
+    present_from: float = 0.0
+    present_until: float | None = None
+    read_probability: float = 1.0
+    rssi_dbm: float | None = -60.0
+    tid: str | None = None
+    user: str | None = None
+
+    def __post_init__(self) -> None:
+        """Validate fields."""
+        if not 0.0 <= self.read_probability <= 1.0:
+            raise ValidationError("read_probability must be within 0..1")
+        if not self.antennas or any(not 1 <= a <= 16 for a in self.antennas):
+            raise ValidationError("antennas must be a non-empty tuple of 1..16")
+        if self.present_until is not None and self.present_until < self.present_from:
+            raise ValidationError("present_until must not be before present_from")
+        tag_record(self.epc, tid=self.tid, user=self.user)  # validates hex/length
+
+    def present(self, t: float) -> bool:
+        """Whether the tag is in the field at scenario time ``t``."""
+        return t >= self.present_from and (
+            self.present_until is None or t < self.present_until
+        )
+
+    def record(self, antenna: int) -> bytes:
+        """Return the ``0x83`` payload for a read on ``antenna``."""
+        return tag_record(
+            self.epc,
+            rssi_dbm=self.rssi_dbm,
+            antenna=antenna,
+            tid=self.tid,
+            user=self.user,
+        )
+
+
 @dataclass
 class Faults:
     """Fault-injection switches. All default to "behave"."""
@@ -122,6 +177,14 @@ class Faults:
     disconnect_on: set[str] = field(default_factory=set)
     #: Send a reply with the wrong sub-command echo for these names.
     wrong_sub: set[str] = field(default_factory=set)
+    #: Close the connection this many seconds after an inventory starts.
+    disconnect_after_s: float | None = None
+    #: Seconds to wait before acknowledging stop (0x8D).
+    stop_ack_delay: float = 0.0
+    #: Close a connection that received nothing for this many seconds while no
+    #: inventory is running (some readers drop idle TCP sessions; unknown for
+    #: the UR4, see docs/hardware-validation.md).
+    idle_timeout_s: float | None = None
 
 
 NAMES: dict[tuple[int, int | None], str] = {
@@ -191,16 +254,32 @@ class FakeUR4:
 
     Attributes you may change at any time: ``state`` (the settings it reports),
     ``faults`` (fault injection), ``tags`` (records sent during an inventory,
-    cycled) and ``tag_interval`` (seconds between tag frames). ``received``
-    holds every frame received; :meth:`names` gives their command names.
+    cycled), ``scenario`` (scripted tags; when set it replaces ``tags``) and
+    ``tag_interval`` (seconds between tag frames, or between read rounds of a
+    scenario). After a client connects, the fake may not have registered the
+    connection yet (the accept handler can run late, notably on macOS); use
+    :meth:`wait_for_connections` rather than reading ``connections`` at once. ``received`` holds every frame received; :meth:`names` gives
+    their command names. ``rng`` (seeded) decides scenario read probabilities,
+    so runs are repeatable; ``clock`` drives the scenario clock.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, seed: int = 0, clock: Callable[[], float] = time.monotonic
+    ) -> None:
         """Create a stopped fake; call :meth:`start` or use ``async with``."""
         self.state = ReaderState()
         self.faults = Faults()
         self.tags: list[bytes] = [tag_record("E28011700000020A1B2C3D4E")]
         self.tag_interval = 0.005
+        self.scenario: list[ScriptedTag] | None = None
+        self.rng = random.Random(seed)
+        self.clock = clock
+        self._t0 = clock()
+        #: Inventories started, and tag reports sent, over the fake's lifetime.
+        self.inventories = 0
+        self.reports_sent = 0
+        #: Connections closed by ``Faults.idle_timeout_s``.
+        self.idle_drops = 0
         self.received: list[Frame] = []
         self.connections = 0
         self._server: asyncio.Server | None = None
@@ -210,12 +289,15 @@ class FakeUR4:
         self.port = 0
         # Replaced (after being set) on every new connection or frame.
         self._activity = asyncio.Event()
+        self._stopping = False
 
     # Lifecycle -----------------------------------------------------------------
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> None:
         """Listen on ``host:port`` (port 0 picks a free one; see ``self.port``)."""
+        self._stopping = False
         self._server = await asyncio.start_server(self._handle, host, port)
+        self.reset_clock()
         self.host = host
         self.port = self._server.sockets[0].getsockname()[1]
 
@@ -234,16 +316,24 @@ class FakeUR4:
         await self.stop()
 
     async def stop(self) -> None:
-        """Close every connection and stop listening. Safe to call twice."""
-        if self._server is not None:
-            self._server.close()
+        """Close every connection and stop listening. Safe to call twice.
+
+        A connection the kernel accepted whose handler has not run yet (seen
+        on macOS) is closed too: ``wait_closed()`` would otherwise wait for it
+        forever.
+        """
+        self._stopping = True
+        server = self._server
+        if server is not None:
+            server.close()
+            server.close_clients()  # also transports whose handler hasn't run
         for writer in list(self._writers):
             writer.close()
         for task in list(self._tasks):
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
-        if self._server is not None:
-            await self._server.wait_closed()
+        if server is not None:
+            await server.wait_closed()
             self._server = None
 
     async def drop_connections(self, timeout: float = 3.0) -> None:
@@ -260,6 +350,14 @@ class FakeUR4:
             writer.close()
         await asyncio.sleep(0.01)
 
+    def reset_clock(self) -> None:
+        """Restart the scenario clock at zero."""
+        self._t0 = self.clock()
+
+    def elapsed(self) -> float:
+        """Seconds on the scenario clock."""
+        return self.clock() - self._t0
+
     def _notify(self) -> None:
         self._activity.set()
         self._activity = asyncio.Event()
@@ -270,6 +368,18 @@ class FakeUR4:
             NAMES.get((f.cmd, f.sub if f.cmd == 0xA1 else None), f"0x{f.cmd:02X}")
             for f in self.received
         ]
+
+    async def wait_for_connections(self, count: int, timeout: float = 3.0) -> None:
+        """Wait until ``count`` connections have been accepted in total.
+
+        Use this instead of reading :attr:`connections` straight after a
+        client's ``connect()``: the kernel completes the handshake before this
+        server's accept handler runs, and on macOS (kqueue) that handler can
+        run noticeably later than on Linux.
+        """
+        async with asyncio.timeout(timeout):
+            while self.connections < count:
+                await self._activity.wait()
 
     async def wait_for(self, name: str, timeout: float = 1.0) -> None:
         """Wait until a command called ``name`` has been received."""
@@ -282,6 +392,11 @@ class FakeUR4:
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        if self._stopping:  # accepted just before stop(); refuse it
+            writer.close()
+            with contextlib.suppress(OSError, ConnectionError):
+                await writer.wait_closed()
+            return
         self.connections += 1
         self._writers.add(writer)
         self._notify()
@@ -290,11 +405,14 @@ class FakeUR4:
         task = asyncio.current_task()
         if task is not None:
             self._tasks.add(task)
+        watchdog = asyncio.create_task(conn.idle_watchdog())
+        self._tasks.add(watchdog)
         try:
             while True:
                 data = await reader.read(4096)
                 if not data:
                     break
+                conn.last_rx = time.monotonic()
                 for frame in decoder.feed(data):
                     self.received.append(frame)
                     self._notify()
@@ -304,6 +422,10 @@ class FakeUR4:
         except ConnectionError:
             pass  # the client went away; clean up below
         finally:
+            watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watchdog
+            self._tasks.discard(watchdog)
             await conn.stop_inventory_task()
             self._writers.discard(writer)
             if task is not None:
@@ -319,6 +441,23 @@ class _Conn:
         self.writer = writer
         self.inventory_task: asyncio.Task[None] | None = None
         self.tags_sent = 0
+        self.last_rx = time.monotonic()
+
+    async def idle_watchdog(self) -> None:
+        """Close the connection after ``Faults.idle_timeout_s`` without traffic."""
+        while not self.writer.is_closing():
+            limit = self.fake.faults.idle_timeout_s
+            if limit is None:
+                await asyncio.sleep(0.05)
+                continue
+            if self.inventory_task is not None:
+                self.last_rx = time.monotonic()  # an inventory is traffic
+            idle = time.monotonic() - self.last_rx
+            if idle >= limit:
+                self.fake.idle_drops += 1
+                self.writer.close()
+                return
+            await asyncio.sleep(min(limit - idle, 0.05))
 
     async def stop_inventory_task(self) -> None:
         task, self.inventory_task = self.inventory_task, None
@@ -390,10 +529,14 @@ class _Conn:
                 await self.reply(name, 0x35, ok + s.temperature_raw.to_bytes(2, "big"))
             case (0x82, None):
                 if self.inventory_task is None:
+                    self.fake.inventories += 1
                     self.inventory_task = asyncio.create_task(self._emit_tags())
             case (0x8C, None):
                 await self.stop_inventory_task()
+                self.last_rx = time.monotonic()
                 if not self.fake.faults.no_stop_ack:
+                    if self.fake.faults.stop_ack_delay:
+                        await asyncio.sleep(self.fake.faults.stop_ack_delay)
                     await self.reply(name, 0x8D, ok)
             case (0xA1, 0x01):
                 s.ip = str(ipaddress.IPv4Address(d[1:5]))
@@ -490,16 +633,48 @@ class _Conn:
 
     async def _emit_tags(self) -> None:
         f = self.fake.faults
+        started = time.monotonic()
         i = 0
         while True:
-            record = self.fake.tags[i % len(self.fake.tags)]
+            scenario = self.fake.scenario
+            if scenario is not None:
+                records = self._scenario_round(scenario)
+            else:
+                records = [self.fake.tags[i % len(self.fake.tags)]]
             i += 1
-            await self.write_frame(encode(0x83, record))
-            self.tags_sent += 1
+            for record in records:
+                await self.write_frame(encode(0x83, record))
+                self.tags_sent += 1
+                self.fake.reports_sent += 1
+                if (
+                    f.disconnect_after_tags is not None
+                    and self.tags_sent >= f.disconnect_after_tags
+                ):
+                    self.writer.close()
+                    return
             if (
-                f.disconnect_after_tags is not None
-                and self.tags_sent >= f.disconnect_after_tags
+                f.disconnect_after_s is not None
+                and time.monotonic() - started >= f.disconnect_after_s
             ):
                 self.writer.close()
                 return
             await asyncio.sleep(self.fake.tag_interval)
+
+    def _scenario_round(self, scenario: list[ScriptedTag]) -> list[bytes]:
+        """Tag records for one read round of the scripted scenario."""
+        fake = self.fake
+        now = fake.elapsed()
+        enabled = fake.state.antenna_mask
+        out: list[bytes] = []
+        for tag in scenario:
+            if not tag.present(now):
+                continue
+            for antenna in tag.antennas:
+                if not enabled & (1 << (antenna - 1)):
+                    continue
+                if (
+                    tag.read_probability >= 1.0
+                    or fake.rng.random() < tag.read_probability
+                ):
+                    out.append(tag.record(antenna))
+        return out
