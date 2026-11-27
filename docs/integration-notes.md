@@ -2,7 +2,7 @@
 
 The pantry integration (Home Assistant, HACS) owns entities, the config flow and
 inventory logic. `aiochainway` owns the bytes. The integration lists
-`aiochainway==0.3.0` in `manifest.json` `requirements` and never builds frames
+`aiochainway==0.4.0` in `manifest.json` `requirements` and never builds frames
 itself.
 
 ## Division of work
@@ -150,6 +150,40 @@ async def on_door_closed() -> None:
   diagnostic sensor.
 
 Test all of this with `FakeUR4` scenarios (see "Testing the integration").
+
+## Enforcing antenna and power settings (v0.4.0)
+
+Call this explicitly, e.g. at setup or from an options-flow "apply" button; the
+library never calls it on its own:
+
+```python
+result = await client.ensure_config({1, 2}, 27)  # enabled antennas, dBm
+if not result.verified:
+    raise_repair_issue("reader_config", result.mismatches)
+elif result.changed:
+    log_info("reader config updated: %s", [w.description for w in result.writes])
+```
+
+* It reads the mask and per-antenna power, writes only what differs (the
+  antenna mask with the save flag, then power per enabled antenna), reads back
+  and verifies. Antennas not listed are disabled; their power is left alone.
+* `dry_run=True` returns the planned writes without sending any; good for
+  an options-flow preview.
+* `ValidationError` (a `ValueError`) for an empty set, ports outside 1–4 or
+  power outside 1–30. Map it to a form error.
+* `save=False` uses an inferred flag and needs `allow_unverified=True`.
+  Don't use it in Pantry Hub until hardware-validation §F.1 confirms it.
+  The reader reports current values, not whether they're saved, so a mask
+  set earlier with `save=False` looks "already correct" to a later
+  `save=True` call and stays unsaved.
+* There is **no antenna detection** on the UR4 (`docs/protocol.md` §4.5), so
+  the integration can't warn about an unplugged antenna. Watch per-antenna
+  read counts (`SweepResult.per_antenna_counts`) instead: an enabled port that
+  never reads anything is worth a repair issue.
+* FakeUR4 models persistence: `await fake.power_cycle()` reverts anything not
+  written with the save flag; `fake.faults.ignore_writes = {"set_power"}`
+  makes a write succeed without taking effect (to test the `verified=False`
+  path).
 
 ## Errors to handle
 

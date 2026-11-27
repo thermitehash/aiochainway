@@ -121,7 +121,39 @@ Pantry Hub's choice depends on this row: keep one connection open with
 
 Compare with the PoE budget of the switch port (802.3af 15.4 W / at 30 W).
 
-## F. Questions to answer with the captures
+## F. Antenna mask and power: persistence and detection (v0.4.0)
+
+Record the original settings first (`aiochainway --json antennas`).
+
+### F.1 Persistence across a power cycle
+
+| ✓ | Step | CLI | Expected / record |
+|---|---|---|---|
+| [ ] | Write with save | `aiochainway config --antennas 1,2 --power 25 --confirm` | `wrote: …` lines then `verified`; frame `28 01 00 03` |
+| [ ] | Power cycle (unplug PoE 10 s), then read | `aiochainway antennas` | antennas 1,2 at 25 dBm? **Record whether the mask and the power each survived.** Power uses the SDK's constant `02` byte, whose meaning is unknown |
+| [ ] | Write without save (inferred flag `00`) | `aiochainway config --antennas 3 --power 20 --confirm --no-save --allow-unverified` | reader accepts? `verified`? frame `28 00 00 04` |
+| [ ] | Power cycle, then read | `aiochainway antennas` | does the mask revert to 1,2 (the flag means "don't save") or stay 3 (it doesn't)? Does power revert? |
+| [ ] | Idempotence | run the first `config … --confirm` twice | second run: `already configured; nothing to write` |
+| [ ] | Restore | `aiochainway config --antennas 1,2,3,4 --power <original> --confirm` | `verified` |
+
+If F.1 shows the `00` flag behaves as "don't save", flip that row in
+`docs/protocol.md` to `verified`; if not, remove `save=False`.
+
+### F.2 Antenna detection
+
+The SDK has **no** detection command (`docs/protocol.md` §4.5), so there's
+nothing to send. Observe instead:
+
+| ✓ | Step | How | Record |
+|---|---|---|---|
+| [ ] | Port 4 empty, antennas 1–4 enabled, sweep | `aiochainway inventory --seconds 10` | any error, beep, LED or reply difference? any `ant4` reads? |
+| [ ] | Same with an antenna on port 4 | same | difference vs the empty port |
+| [ ] | Reader LEDs / web UI (if any) | look | any per-port connection indicator |
+
+If an empty port can be told apart (and only then), raise it with Chainway
+support and update §4.5.
+
+## G. Questions to answer with the captures
 
 1. Does start inventory (`82`) get a reply frame?
 2. In auto mode, does the reader still accept TCP commands, and does it also push
@@ -134,3 +166,5 @@ Compare with the PoE budget of the switch port (802.3af 15.4 W / at 30 W).
 8. PoE: does the reader boot from your switch (802.3af vs at)? (Power figures: §E.3.)
 9. Does the reader drop idle TCP sessions, and after how long? (§E.2.)
 10. How repeatable is a 45 s sweep over a static tag set? (§E.1.)
+11. Do the antenna mask and power survive a power cycle, and does the inferred `00` flag mean "don't save"? (§F.1.)
+12. Is an empty antenna port detectable at all? (§F.2.)

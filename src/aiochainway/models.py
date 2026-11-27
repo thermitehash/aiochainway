@@ -435,3 +435,38 @@ class SweepResult:
         if self.started_at is None:
             return None
         return self.ended_at - self.started_at
+
+
+@dataclass(frozen=True, slots=True)
+class ReaderConfig:
+    """Enabled antennas and per-antenna power (dBm), as read from the reader."""
+
+    antennas: frozenset[int]
+    power: dict[int, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigWrite:
+    """One write made (or planned) by ``UR4Client.ensure_config``."""
+
+    command: str
+    description: str
+    frame_hex: str
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigResult:
+    """Result of ``UR4Client.ensure_config``.
+
+    ``changed`` is true when at least one write was sent (in a dry run, when
+    one would have been). ``verified`` is true only when the read-back after
+    the writes matches the request; ``mismatches`` says what didn't.
+    """
+
+    changed: bool
+    before: ReaderConfig
+    after: ReaderConfig | None
+    writes: tuple[ConfigWrite, ...] = ()
+    verified: bool = False
+    dry_run: bool = False
+    mismatches: tuple[str, ...] = ()

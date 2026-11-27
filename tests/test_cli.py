@@ -71,8 +71,11 @@ async def test_inventory(fake: FakeUR4, capsys: pytest.CaptureFixture[str]) -> N
 
 
 async def test_antennas_power_region_beep(fake: FakeUR4) -> None:
-    assert await run(fake, "antennas") == (0, "1,2,3,4\n")
-    assert await run(fake, "antennas", "--set", "1,3") == (0, "1,3\n")
+    code, out = await run(fake, "antennas")
+    assert code == 0 and out.startswith("antennas:  1,2,3,4\n")
+    assert "ant1=30 dBm" in out and "detection: not supported" in out
+    code, out = await run(fake, "antennas", "--set", "1,3")
+    assert code == 0 and out.startswith("antennas:  1,3\n")
     code, out = await run(fake, "power", "--set", "20")
     assert code == 0 and out.startswith("ant1=20 dBm")
     code, out = await run(fake, "power", "--set", "12", "--antenna", "2")

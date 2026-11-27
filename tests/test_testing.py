@@ -37,6 +37,7 @@ SAMPLE_ARGS: dict[str, tuple[Any, ...]] = {
     "set_gpo": (GpoState(relay=True),),
     "set_trigger_config": (TriggerConfig(),),
     "set_antennas": (AntennaState.of(1, 2),),
+    "set_antennas_no_save": (AntennaState.of(1, 2),),
     "set_power": (1, 20),
     "set_power_all": ([(1, 20), (2, 21)],),
     "set_region": (FrequencyRegion.USA,),
@@ -59,7 +60,8 @@ def test_names_match_the_command_registry() -> None:
         info = c.COMMANDS[name]
         assert (info.cmd, info.sub) == (cmd, sub), name
     # set_power_all shares CMD 0x10 with set_power; the fake labels both set_power.
-    assert set(NAMES.values()) | {"set_power_all"} >= {
+    # set_antennas_no_save shares CMD 0x28 with set_antennas (flag byte 00).
+    assert set(NAMES.values()) | {"set_power_all", "set_antennas_no_save"} >= {
         name for name, info in c.COMMANDS.items() if info.supported
     }
 
