@@ -14,6 +14,7 @@ jobs:
   lint:
     name: Ruff + mypy
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -27,6 +28,7 @@ jobs:
   tests:
     name: Pytest (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -42,7 +44,7 @@ jobs:
           cache-dependency-path: pyproject.toml
       - run: pip install -e ".[dev]"
       - name: Tests with coverage
-        run: python -m pytest -q --cov=aiochainway --cov-branch --cov-report=term-missing --cov-fail-under=85
+        run: python -m pytest -v --durations=15 --cov=aiochainway --cov-branch --cov-report=term-missing --cov-fail-under=85
       - name: Coverage gate for protocol/ and presence.py (95%)
         run: python -m coverage report --include="*/aiochainway/protocol/*,*/aiochainway/presence.py" --fail-under=95
       - name: CLI smoke test
@@ -84,6 +86,7 @@ jobs:
     name: Mutation testing (protocol/)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6

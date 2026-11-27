@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator, Callable
 import gc
 import os
+import sys
 
 from hypothesis import HealthCheck, settings
 import pytest
@@ -22,6 +23,37 @@ settings.register_profile(
     print_blob=True,
 )
 settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "dev"))
+
+
+#: A test still running after this many seconds is reported and cancelled.
+HANG_TIMEOUT = float(os.environ.get("TEST_HANG_TIMEOUT", "60"))
+
+
+@pytest.fixture(autouse=True)
+async def hang_watchdog(request: pytest.FixtureRequest) -> AsyncIterator[None]:
+    """Turn a hung async test into a failure that shows where it is stuck.
+
+    After ``HANG_TIMEOUT`` seconds, print the stack of every asyncio task, then
+    cancel them all so the test fails instead of hanging the CI job.
+    """
+    loop = asyncio.get_running_loop()
+
+    def dump() -> None:
+        tasks = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        print(
+            f"\n=== {request.node.nodeid} still running after {HANG_TIMEOUT:g}s;"
+            f" {len(tasks)} asyncio task(s):",
+            file=sys.stderr,
+        )
+        for task in tasks:
+            print(f"--- {task!r}", file=sys.stderr)
+            task.print_stack(file=sys.stderr)
+        for task in tasks:
+            task.cancel()
+
+    handle = loop.call_later(HANG_TIMEOUT, dump)
+    yield
+    handle.cancel()
 
 
 @pytest.fixture(autouse=True)
